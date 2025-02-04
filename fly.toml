@@ -1,20 +1,32 @@
-# fly.toml app configuration file generated for backend-app-mkawqchd-damp-butterfly-9495 on 2025-02-04T05:43:50Z
+# fly.toml app configuration file
 #
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
 
-app = 'backend-app-mkawqchd-1738594929'
+app = 'backend-app-ikkjfeex-lively-shadow-8911'
 primary_region = 'sea'
 
 [build]
 
+[env]
+  BACKEND_URL = "https://backend-app-ikkjfeex-lively-shadow-8911.fly.dev"
+  FRONTEND_URL = "https://google-calendar-bot-lb7lm5oq.devinapps.com"
+  PORT = "8000"
+  REDIS_HOST = "fly-calendar-bot-redis.upstash.io"
+  REDIS_PORT = "6379"
+
 [http_service]
-  internal_port = 8080
+  internal_port = 8000
   force_https = true
-  auto_stop_machines = 'stop'
+  auto_stop_machines = true
   auto_start_machines = true
   min_machines_running = 0
   processes = ['app']
+  
+[[vm]]
+  memory = "256MB"
+  cpu_kind = "shared"
+  cpus = 1
 
 [[vm]]
   memory = '1gb'
