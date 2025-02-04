@@ -63,6 +63,22 @@ async def get_bot(bot_id: str):
         raise HTTPException(status_code=404, detail="Bot not found")
     return BOTS[bot_id]
 
+@app.get("/calendar/events")
+async def get_events(user_ids: str):
+    user_id_list = user_ids.split(',')
+    now = datetime.now()
+    week_later = now + timedelta(days=7)
+    
+    all_events = {}
+    for user_id in user_id_list:
+        try:
+            events = await get_calendar_events(user_id.strip(), now, week_later)
+            all_events[user_id] = events
+        except Exception as e:
+            all_events[user_id] = {"error": str(e)}
+    
+    return all_events
+
 @app.post("/chat/{bot_id}")
 async def chat(bot_id: str, request: ChatRequest):
     if bot_id not in BOTS:
@@ -219,7 +235,20 @@ async def get_calendar_events(user_id: str, time_min: datetime, time_max: dateti
             orderBy='startTime'
         ).execute()
         
-        return events_result.get('items', [])
+        events = events_result.get('items', [])
+        formatted_events = []
+        
+        for event in events:
+            start = event['start'].get('dateTime', event['start'].get('date'))
+            end = event['end'].get('dateTime', event['end'].get('date'))
+            formatted_events.append({
+                'summary': event.get('summary', '予定あり'),
+                'start': start,
+                'end': end,
+                'id': event['id']
+            })
+            
+        return formatted_events
 
 if __name__ == "__main__":
     import uvicorn
