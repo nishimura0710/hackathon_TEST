@@ -12,10 +12,14 @@ from googleapiclient.discovery import build
 from datetime import datetime, timedelta
 import json
 import asyncio
+from typing import Optional, Dict
 
 load_dotenv()
 
 app = FastAPI()
+
+# Global variable to store credentials (POC only - would use secure storage in production)
+calendar_credentials: Dict[str, Credentials] = {}
 
 # CORS設定
 app.add_middleware(
@@ -33,8 +37,8 @@ BOTS = {
         "name": "日程調整Bot",
         "description": "日程調整を手伝います",
         "system_prompt": """あなたは日程調整の専門家です。ユーザーの日程調整を手伝ってください。
-ただし、現時点ではGoogleカレンダーとの連携は実装されていないため、
-カレンダーの情報は取得できません。その旨をユーザーに伝えてください。""",
+Googleカレンダーから予定を取得し、空き時間を見つけることができます。
+ユーザーの要望に応じて、適切な日時を提案してください。""",
     }
 }
 
@@ -71,12 +75,29 @@ async def chat(bot_id: str, request: ChatRequest):
         
         print(f"Processing chat request for bot: {bot_id}")
         print(f"Received messages: {request.messages}")
+        
+        # カレンダー情報を取得
+        user_id = "default_user"
+        if bot_id == "schedule" and user_id in calendar_credentials:
+            now = datetime.now()
+            week_later = now + timedelta(days=7)
+            try:
+                events = await get_calendar_events(user_id, now, week_later)
+                calendar_info = "\n\n利用可能なカレンダー情報:\n"
+                for event in events:
+                    start = event['start'].get('dateTime', event['start'].get('date'))
+                    end = event['end'].get('dateTime', event['end'].get('date'))
+                    calendar_info += f"- {event['summary']}: {start} から {end}\n"
+            except Exception as e:
+                calendar_info = "\n\nカレンダー情報の取得に失敗しました。"
+        else:
+            calendar_info = "\n\nカレンダーの認証が必要です。/auth/google エンドポイントで認証を行ってください。"
             
         client = anthropic.AsyncAnthropic(api_key=api_key)
         
         # システムプロンプトとユーザーメッセージを結合
         system_prompt = BOTS[bot_id]["system_prompt"]
-        user_message = request.messages[-1].content
+        user_message = request.messages[-1].content + calendar_info
         
         print(f"System prompt: {system_prompt}")
         print(f"User message: {user_message}")
@@ -148,7 +169,7 @@ async def google_auth():
             "installed": {
                 "client_id": os.getenv("GOOGLE_CLIENT_ID"),
                 "client_secret": os.getenv("GOOGLE_CLIENT_SECRET"),
-                "redirect_uris": ["urn:ietf:wg:oauth:2.0:oob"],
+                "redirect_uris": ["http://localhost:8000/auth/google/callback"],
                 "auth_uri": "https://accounts.google.com/o/oauth2/auth",
                 "token_uri": "https://oauth2.googleapis.com/token"
             }
@@ -157,6 +178,48 @@ async def google_auth():
     )
     auth_url = flow.authorization_url()
     return {"auth_url": auth_url[0]}
+
+@app.post("/auth/google/callback")
+async def google_auth_callback(code: str):
+    try:
+        flow = InstalledAppFlow.from_client_config(
+            {
+                "installed": {
+                    "client_id": os.getenv("GOOGLE_CLIENT_ID"),
+                    "client_secret": os.getenv("GOOGLE_CLIENT_SECRET"),
+                    "redirect_uris": ["http://localhost:8000/auth/google/callback"],
+                    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                    "token_uri": "https://oauth2.googleapis.com/token"
+                }
+            },
+            SCOPES
+        )
+        flow.fetch_token(code=code)
+        credentials = flow.credentials
+        
+        # Store credentials in memory (POC only)
+        user_id = "default_user"  # In production, this would be a real user ID
+        calendar_credentials[user_id] = credentials
+        
+        return {"message": "認証が完了しました。カレンダー情報にアクセスできるようになりました。"}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+async def get_calendar_events(user_id: str, time_min: datetime, time_max: datetime):
+    if user_id not in calendar_credentials:
+        raise HTTPException(status_code=401, detail="カレンダーの認証が必要です")
+    
+    try:
+        service = build('calendar', 'v3', credentials=calendar_credentials[user_id])
+        events_result = service.events().list(
+            calendarId='primary',
+            timeMin=time_min.isoformat() + 'Z',
+            timeMax=time_max.isoformat() + 'Z',
+            singleEvents=True,
+            orderBy='startTime'
+        ).execute()
+        
+        return events_result.get('items', [])
 
 if __name__ == "__main__":
     import uvicorn
