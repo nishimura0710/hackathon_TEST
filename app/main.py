@@ -1,7 +1,8 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, AsyncGenerator
 import anthropic
 import os
 from dotenv import load_dotenv
@@ -10,6 +11,7 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from datetime import datetime, timedelta
 import json
+import asyncio
 
 load_dotenv()
 
@@ -30,13 +32,9 @@ BOTS = {
         "id": "schedule",
         "name": "日程調整Bot",
         "description": "日程調整を手伝います",
-        "system_prompt": "あなたは日程調整の専門家です。ユーザーの日程調整を手伝ってください。",
-    },
-    "research": {
-        "id": "research",
-        "name": "リサーチBot",
-        "description": "調査研究を支援します",
-        "system_prompt": "あなたは研究調査の専門家です。ユーザーの調査を手伝ってください。",
+        "system_prompt": """あなたは日程調整の専門家です。ユーザーの日程調整を手伝ってください。
+ただし、現時点ではGoogleカレンダーとの連携は実装されていないため、
+カレンダーの情報は取得できません。その旨をユーザーに伝えてください。""",
     }
 }
 
@@ -67,23 +65,78 @@ async def chat(bot_id: str, request: ChatRequest):
         raise HTTPException(status_code=404, detail="Bot not found")
     
     try:
-        client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+        api_key = os.getenv("ANTHROPIC_API_KEY")
+        if not api_key:
+            raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not set")
+        
+        print(f"Processing chat request for bot: {bot_id}")
+        print(f"Received messages: {request.messages}")
+            
+        client = anthropic.AsyncAnthropic(api_key=api_key)
         
         # システムプロンプトとユーザーメッセージを結合
-        messages = [
-            {"role": "system", "content": BOTS[bot_id]["system_prompt"]},
-            *request.messages
-        ]
+        system_prompt = BOTS[bot_id]["system_prompt"]
+        user_message = request.messages[-1].content
+        
+        print(f"System prompt: {system_prompt}")
+        print(f"User message: {user_message}")
         
         # Claude APIを使用してレスポンスを生成
-        response = client.messages.create(
+        message = await client.messages.create(
             model="claude-3-opus-20240229",
             max_tokens=1000,
-            messages=messages,
-            stream=True
+            messages=[
+                {
+                    "role": "user",
+                    "content": user_message
+                }
+            ],
+            system=system_prompt
         )
         
-        return response
+        async def generate() -> AsyncGenerator[str, None]:
+            content = message.content
+            print(f"Full response content: {content}")
+            
+            # Send role first
+            yield "data: " + json.dumps({
+                "id": message.id,
+                "object": "chat.completion.chunk",
+                "created": int(datetime.now().timestamp()),
+                "model": "claude-3-opus-20240229",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant"
+                    }
+                }]
+            }) + "\n\n"
+            
+            # Send content
+            yield "data: " + json.dumps({
+                "id": message.id,
+                "object": "chat.completion.chunk",
+                "created": int(datetime.now().timestamp()),
+                "model": "claude-3-opus-20240229",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "content": content
+                    }
+                }]
+            }) + "\n\n"
+            
+            # Send completion
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(
+            generate(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+            }
+        )
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

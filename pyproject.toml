@@ -3,6 +3,7 @@ name = "backend_app"
 version = "0.1.0"
 description = "Multi-bot Chat Backend API"
 authors = ["Devin <devin@example.com>"]
+package-mode = false
 
 [tool.poetry.dependencies]
 python = "^3.12"
@@ -12,7 +13,7 @@ pydantic = "^2.5.3"
 openai = "^1.10.0"
 python-dotenv = "^1.0.0"
 fastapi-cli = "^0.0.7"
-anthropic = "^0.7.1"
+anthropic = "^0.45.2"
 google-auth-oauthlib = "^1.2.0"
 google-auth-httplib2 = "^0.2.0"
 google-api-python-client = "^2.118.0"
