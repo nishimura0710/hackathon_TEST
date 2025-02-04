@@ -104,7 +104,16 @@ export const ChatInterface = ({ bot }: ChatInterfaceProps) => {
   return (
     <Card className="w-full max-w-2xl mx-auto">
       <CardHeader>
-        <CardTitle>{bot.name}</CardTitle>
+        <CardTitle className="flex justify-between items-center">
+          <span>{bot.name}</span>
+          <Button
+            variant="outline"
+            onClick={() => window.open("https://backend-app-mkawqchd-1738594929.fly.dev/auth/google", "_blank")}
+            className="ml-4"
+          >
+            Googleカレンダーと連携
+          </Button>
+        </CardTitle>
       </CardHeader>
       <CardContent className="h-[60vh] overflow-y-auto">
         <div className="flex flex-col space-y-4">
