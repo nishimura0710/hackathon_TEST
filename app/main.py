@@ -1,17 +1,64 @@
 from datetime import datetime, timedelta
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Union
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from google_auth_oauthlib.flow import Flow
-from pydantic import BaseModel
+from pydantic import BaseModel, root_validator, validator
 import redis
 import json
 import os
+import re
 import anthropic
 import pytz
+
+class EventCreateRequest(BaseModel):
+    date: str
+    start_time: str
+    end_time: str
+    title: str
+    description: Optional[str] = None
+
+    @validator('date')
+    def validate_date(cls, v):
+        try:
+            datetime.strptime(v, '%Y-%m-%d')
+            return v
+        except ValueError:
+            raise ValueError('日付の形式が正しくありません')
+
+    @validator('start_time', 'end_time')
+    def validate_time(cls, v):
+        try:
+            datetime.strptime(v, '%H:%M')
+            return v
+        except ValueError:
+            raise ValueError('時間の形式が正しくありません')
+
+class Message(BaseModel):
+    role: str
+    content: str
+
+class EventMessage(Message, EventCreateRequest):
+    pass
+
+class ChatRequest(BaseModel):
+    messages: Optional[List[Message]] = None
+    message: Optional[str] = None
+    events: Optional[List[dict]] = None
+
+    @root_validator(pre=True)
+    def check_message_format(cls, values):
+        if not values.get("messages") and not values.get("message"):
+            raise ValueError("メッセージが見つかりません")
+        if not values.get("messages"):
+            values["messages"] = [Message(
+                role="user",
+                content=values["message"]
+            )]
+        return values
 
 app = FastAPI()
 
@@ -45,6 +92,47 @@ async def get_calendar_list(credentials: Credentials) -> List[dict]:
         print(f"Error fetching calendar list: {str(e)}")
         raise
 
+async def create_calendar_event(service, event_data: EventCreateRequest):
+    """Create a new calendar event."""
+    try:
+        date = datetime.strptime(event_data.date, '%Y-%m-%d')
+        start_time = datetime.strptime(event_data.start_time, '%H:%M')
+        end_time = datetime.strptime(event_data.end_time, '%H:%M')
+        
+        start_datetime = date.replace(
+            hour=start_time.hour,
+            minute=start_time.minute
+        )
+        end_datetime = date.replace(
+            hour=end_time.hour,
+            minute=end_time.minute
+        )
+        
+        jst = pytz.timezone('Asia/Tokyo')
+        start_datetime = jst.localize(start_datetime)
+        end_datetime = jst.localize(end_datetime)
+        
+        event = {
+            'summary': event_data.title,
+            'description': event_data.description,
+            'start': {
+                'dateTime': start_datetime.isoformat(),
+                'timeZone': 'Asia/Tokyo',
+            },
+            'end': {
+                'dateTime': end_datetime.isoformat(),
+                'timeZone': 'Asia/Tokyo',
+            },
+        }
+        
+        event = service.events().insert(calendarId='primary', body=event).execute()
+        return event
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"予定の登録ができませんでした：{str(e)}"
+        )
+
 async def get_calendar_events(credentials: Credentials, time_min: datetime, time_max: datetime):
     """Fetch calendar events for the specified time range from all accessible calendars."""
     try:
@@ -55,24 +143,22 @@ async def get_calendar_events(credentials: Credentials, time_min: datetime, time
         for calendar in calendars:
             calendar_id = calendar['id']
             try:
-                # Skip calendars we can't access
                 if calendar.get('accessRole') not in ['owner', 'writer', 'reader']:
                     print(f"Skipping calendar {calendar_id} due to insufficient access rights")
                     continue
-                    
-                # Ensure timezone is properly formatted in RFC3339 format
-                time_min_str = time_min.astimezone(pytz.UTC).isoformat()
-                time_max_str = time_max.astimezone(pytz.UTC).isoformat()
+                
+                time_min_utc = time_min.astimezone(pytz.UTC)
+                time_max_utc = time_max.astimezone(pytz.UTC)
                 
                 print(f"\nFetching events for calendar: {calendar_id}")
                 print(f"Access role: {calendar.get('accessRole')}")
-                print(f"Time range: {time_min_str} to {time_max_str}")
+                print(f"Time range: {time_min_utc} to {time_max_utc}")
                 
                 try:
                     events_result = service.events().list(
                         calendarId=calendar_id,
-                        timeMin=time_min_str,
-                        timeMax=time_max_str,
+                        timeMin=time_min_utc.isoformat(),
+                        timeMax=time_max_utc.isoformat(),
                         singleEvents=True,
                         orderBy='startTime',
                         maxResults=100
@@ -81,17 +167,40 @@ async def get_calendar_events(credentials: Credentials, time_min: datetime, time
                     print(f"Error fetching events for calendar {calendar_id}: {str(e)}")
                     continue
                 
+                jst = pytz.timezone('Asia/Tokyo')
                 events = events_result.get('items', [])
                 for event in events:
-                    start = event['start'].get('dateTime', event['start'].get('date'))
-                    end = event['end'].get('dateTime', event['end'].get('date'))
-                    all_events.append({
-                        'summary': event.get('summary', '(タイトルなし)'),
-                        'start': start,
-                        'end': end,
-                        'status': event.get('status', 'confirmed'),
-                        'calendar': calendar.get('summary', 'Unknown Calendar')
-                    })
+                    try:
+                        start_data = event['start']
+                        end_data = event['end']
+                        
+                        jst = pytz.timezone('Asia/Tokyo')
+                        if 'dateTime' in start_data:
+                            start = datetime.fromisoformat(start_data['dateTime'].replace('Z', '+00:00'))
+                            if not start.tzinfo:
+                                start = pytz.UTC.localize(start)
+                            start = start.astimezone(jst)
+                            
+                            end = datetime.fromisoformat(end_data['dateTime'].replace('Z', '+00:00'))
+                            if not end.tzinfo:
+                                end = pytz.UTC.localize(end)
+                            end = end.astimezone(jst)
+                        else:
+                            start = datetime.fromisoformat(start_data['date'])
+                            start = jst.localize(start.replace(hour=0, minute=0))
+                            end = datetime.fromisoformat(end_data['date'])
+                            end = jst.localize(end.replace(hour=23, minute=59))
+                        
+                        all_events.append({
+                            'summary': event.get('summary', '(タイトルなし)'),
+                            'start': start,
+                            'end': end,
+                            'status': event.get('status', 'confirmed'),
+                            'calendar': calendar.get('summary', 'Unknown Calendar')
+                        })
+                    except Exception as e:
+                        print(f"Error processing event: {str(e)}")
+                        continue
             except Exception as e:
                 print(f"Error fetching events for calendar {calendar_id}: {str(e)}")
                 continue
@@ -128,7 +237,7 @@ async def google_auth():
         from google_auth_oauthlib.flow import Flow
         flow = Flow.from_client_secrets_file(
             'app/client_secrets.json',
-            scopes=['https://www.googleapis.com/auth/calendar.readonly'],
+            scopes=['https://www.googleapis.com/auth/calendar.readonly', 'https://www.googleapis.com/auth/calendar.events'],
             redirect_uri=f"{os.getenv('BACKEND_URL', '')}/auth/google/callback"
         )
         auth_url, _ = flow.authorization_url(
@@ -151,7 +260,7 @@ async def google_auth_callback(code: str, state: str):
         from google_auth_oauthlib.flow import Flow
         flow = Flow.from_client_secrets_file(
             'app/client_secrets.json',
-            scopes=['https://www.googleapis.com/auth/calendar.readonly'],
+            scopes=['https://www.googleapis.com/auth/calendar.readonly', 'https://www.googleapis.com/auth/calendar.events'],
             redirect_uri=f"{os.getenv('BACKEND_URL', '')}/auth/google/callback"
         )
         flow.fetch_token(code=code)
@@ -169,12 +278,7 @@ async def google_auth_callback(code: str, state: str):
             detail="認証コールバックの処理に失敗しました"
         )
 
-class Message(BaseModel):
-    role: str
-    content: str
 
-class ChatRequest(BaseModel):
-    messages: List[Message]
 
 @app.get("/calendar/events")
 async def get_events():
@@ -211,6 +315,8 @@ async def get_events():
 @app.post("/chat/schedule")
 async def chat_schedule(request: ChatRequest):
     try:
+        print("\n=== Chat Schedule Request ===")
+        print(f"Request messages: {json.dumps(request.dict(), ensure_ascii=False, indent=2)}")
         user_id = "default_user"
         credentials = get_credentials(user_id)
         if not credentials:
@@ -219,91 +325,140 @@ async def chat_schedule(request: ChatRequest):
                 detail="カレンダーの認証が必要です"
             )
 
-        # Extract date and time from the last message
+        # Extract date and time from the message
+        if not request.messages:
+            return {"response": "メッセージを入力してください。"}
         last_message = request.messages[-1].content
         
-        # Default to today's date in JST
-        jst_now = datetime.utcnow() + timedelta(hours=9)
-        target_date = jst_now
+        # Check for event creation commands
+        available_slot_pattern = re.compile(r'(\d+)月(\d+)日の空いている時間に(.+)を登録して')
+        event_match = re.match(
+            r'(\d+)月(\d+)日の(\d+)時から(\d+)時まで(.+)を登録して',
+            last_message
+        )
+        print(f"\nChecking event creation command: {last_message}")
+        print(f"Regex match result: {event_match is not None}")
+        available_slot_match = available_slot_pattern.match(last_message)
+        print(f"Available slot match result: {available_slot_match is not None}")
         
-        # Parse date from message
-        if "月" in last_message and "日" in last_message:
-            try:
-                # Extract numbers before 月 and 日
-                month_idx = last_message.index("月")
-                day_idx = last_message.index("日")
-                
-                # Look for numbers before these markers
-                month_str = ""
-                day_str = ""
-                
-                for i in range(month_idx - 1, -1, -1):
-                    if last_message[i].isdigit():
-                        month_str = last_message[i] + month_str
-                    else:
-                        break
-                        
-                for i in range(day_idx - 1, month_idx, -1):
-                    if last_message[i].isdigit():
-                        day_str = last_message[i] + day_str
-                    else:
-                        break
-                
-                if not month_str or not day_str:
-                    return {"response": "確認したい日付を指定してください。"}
-                    
-                month = int(month_str)
-                day = int(day_str)
-                target_date = datetime(jst_now.year, month, day)
-            except (ValueError, IndexError):
-                return {"response": "確認したい日付を指定してください。"}
-        else:
-            return {"response": "確認したい日付を指定してください。"}
+        if available_slot_match:
+            month, day, title = available_slot_match.groups()
+            month, day = map(int, [month, day])
             
-        # Set default time range (full day in UTC)
-        jst = pytz.timezone('Asia/Tokyo')
-        utc = pytz.UTC
+            # Get current year and handle year rollover
+            now = datetime.now(pytz.timezone('Asia/Tokyo'))
+            year = now.year
+            if month < now.month:
+                year += 1
+                
+            # Set up target date
+            target_date = now.replace(year=year, month=month, day=day)
+            start_time = target_date.replace(hour=0, minute=0)
+            end_time = target_date.replace(hour=23, minute=59)
+            
+            # Get available slots
+            events = await get_calendar_events(credentials, start_time, end_time)
+            
+            # Set business hours
+            business_start = target_date.replace(hour=9, minute=0)
+            business_end = target_date.replace(hour=17, minute=0)
+            
+            if not events:
+                # No events, use first business hour
+                event_start = business_start
+                event_end = event_start + timedelta(hours=1)
+            else:
+                # Find first available slot of at least 1 hour during business hours
+                current_time = business_start
+                event_start = None
+                event_end = None
+                
+                for event in sorted(events, key=lambda x: x['start']):
+                    if event['start'] > current_time and current_time < business_end:
+                        duration = (event['start'] - current_time).total_seconds() / 3600
+                        if duration >= 1:
+                            event_start = current_time
+                            event_end = current_time + timedelta(hours=1)
+                            break
+                    current_time = max(current_time, event['end'])
+                
+                # If no slot found during business hours, try after business hours
+                if not event_start and current_time < end_time:
+                    if current_time < business_start:
+                        current_time = business_start
+                    event_start = current_time
+                    event_end = current_time + timedelta(hours=1)
+            
+            if not event_start:
+                return {"response": f"{month}月{day}日には空き時間が見つかりませんでした。"}
+            
+            try:
+                event_data = EventCreateRequest(
+                    date=f"{year}-{month:02d}-{day:02d}",
+                    start_time=event_start.strftime("%H:%M"),
+                    end_time=event_end.strftime("%H:%M"),
+                    title=title
+                )
+                
+                service = build('calendar', 'v3', credentials=credentials)
+                event = await create_calendar_event(service, event_data)
+                return {"response": f"{month}月{day}日 {event_start.strftime('%H:%M')}〜{event_end.strftime('%H:%M')}に「{title}」を登録しました"}
+            except Exception as e:
+                return {"response": f"申し訳ありません。予定の登録ができませんでした：{str(e)}"}
         
-        # Create timezone-aware datetime objects
-        start_time = jst.localize(datetime.combine(target_date.date(), datetime.min.time())).astimezone(utc)
-        end_time = jst.localize(datetime.combine(target_date.date(), datetime.max.time())).astimezone(utc)
+        elif event_match:
+            month, day, start_hour, end_hour, title = event_match.groups()
+            month, day, start_hour, end_hour = map(int, [month, day, start_hour, end_hour])
+            
+            # Get current year and handle year rollover
+            now = datetime.now(pytz.timezone('Asia/Tokyo'))
+            year = now.year
+            if month < now.month:
+                year += 1
+                
+            try:
+                event_data = EventCreateRequest(
+                    date=f"{year}-{month:02d}-{day:02d}",
+                    start_time=f"{start_hour:02d}:00",
+                    end_time=f"{end_hour:02d}:00",
+                    title=title
+                )
+                print(f"\nAttempting to create event: {json.dumps(event_data.dict(), ensure_ascii=False, indent=2)}")
+                
+                service = build('calendar', 'v3', credentials=credentials)
+                event = await create_calendar_event(service, event_data)
+                return {"response": f"{month}月{day}日 {start_hour:02d}:00〜{end_hour:02d}:00に「{title}」を登録しました"}
+            except Exception as e:
+                return {"response": f"申し訳ありません。予定の登録ができませんでした：{str(e)}"}
+        
+        # Parse date from message for availability check
+        date_match = re.search(r'(\d+)月(\d+)日', last_message)
+        if not date_match:
+            return {"response": "確認したい日付を指定してください。"}
+        
+        month, day = map(int, date_match.groups())
+        jst = pytz.timezone('Asia/Tokyo')
+        now = datetime.now(jst)
+        
+        # Handle year rollover if the requested month is earlier than current month
+        year = now.year
+        if month < now.month:
+            year += 1
+            
+        target_date = now.replace(year=year, month=month, day=day)
+        
+        # Set default time range (full day in JST)
+        start_time = target_date.replace(hour=0, minute=0, second=0, microsecond=0)
+        end_time = target_date.replace(hour=23, minute=59, second=59, microsecond=999999)
         
         # Parse time range if specified
-        if "時" in last_message:
-            try:
-                # Extract start and end hours
-                start_hour = None
-                end_hour = None
-                
-                # Look for patterns like "13時から17時" or "13時〜17時"
-                parts = last_message.split("時")
-                for i, part in enumerate(parts[:-1]):
-                    # Extract the number before "時"
-                    num = ""
-                    for char in reversed(part):
-                        if char.isdigit():
-                            num = char + num
-                        else:
-                            break
-                    
-                    if num:
-                        hour = int(num)
-                        if "から" in part or "～" in part or "〜" in part:
-                            start_hour = hour
-                        elif i + 1 < len(parts) and ("まで" in parts[i+1] or "迄" in parts[i+1]):
-                            end_hour = hour
-                
-                if start_hour is not None:
-                    start_time = jst.localize(
-                        datetime.combine(target_date.date(), datetime.min.time().replace(hour=start_hour))
-                    ).astimezone(utc)
-                if end_hour is not None:
-                    end_time = jst.localize(
-                        datetime.combine(target_date.date(), datetime.min.time().replace(hour=end_hour))
-                    ).astimezone(utc)
-            except ValueError as e:
-                print(f"Error parsing time range: {str(e)}")
-                # Continue with default full day range
+        time_range = re.search(r'(\d+)時(?:から|〜|～)(\d+)時', last_message)
+        if time_range:
+            start_hour, end_hour = map(int, time_range.groups())
+            # Ensure end_hour is inclusive (e.g. "17時" means until 17:59:59)
+            start_time = target_date.replace(hour=start_hour, minute=0, second=0, microsecond=0)
+            end_time = target_date.replace(hour=end_hour, minute=59, second=59, microsecond=999999)
+            print(f"Time range specified: {start_hour}:00-{end_hour}:59")
 
         # Fetch events from all calendars
         try:
@@ -321,76 +476,32 @@ async def chat_schedule(request: ChatRequest):
                 detail="カレンダー情報の取得に失敗しました"
             )
         
-        # Convert events to JST and sort
-        print("\nConverting events to JST...")
-        jst_events = []
-        for event in events:
-            try:
-                # Parse datetime with proper timezone handling
-                start_str = event['start'] if isinstance(event['start'], str) else event['start'].get('dateTime', event['start'].get('date'))
-                end_str = event['end'] if isinstance(event['end'], str) else event['end'].get('dateTime', event['end'].get('date'))
-                
-                print(f"\nProcessing event: {event.get('summary')} from {event.get('calendar')}")
-                print(f"Raw times: {start_str} - {end_str}")
-                
-                # Handle both full datetime and date-only formats
-                if 'T' in start_str:  # Full datetime
-                    event_start = datetime.fromisoformat(start_str.replace('Z', '+00:00'))
-                else:  # Date only
-                    event_start = datetime.fromisoformat(start_str + 'T00:00:00+00:00')
-                    
-                if 'T' in end_str:  # Full datetime
-                    event_end = datetime.fromisoformat(end_str.replace('Z', '+00:00'))
-                else:  # Date only
-                    event_end = datetime.fromisoformat(end_str + 'T23:59:59+00:00')
-                
-                # Convert to JST
-                event_start = event_start + timedelta(hours=9)
-                event_end = event_end + timedelta(hours=9)
-                print(f"JST times: {event_start.strftime('%Y-%m-%d %H:%M')} - {event_end.strftime('%Y-%m-%d %H:%M')}")
-                
-                jst_events.append({
-                    'start': event_start,
-                    'end': event_end,
-                    'summary': event.get('summary'),
-                    'calendar': event.get('calendar')
-                })
-            except Exception as e:
-                print(f"Error processing event: {str(e)}")
-                continue
+        # Events are already in JST from get_calendar_events
+        print("\nProcessing events...")
+        events.sort(key=lambda x: x['start'])
         
-        jst_events.sort(key=lambda x: x['start'])
-        
-        # Calculate available slots in JST
+        # Calculate available slots
         print("\nCalculating available slots...")
         available_slots = []
-        current_time = start_time + timedelta(hours=9)
-        end_time_jst = end_time + timedelta(hours=9)
-        
-        # Ensure we respect the requested time range
-        target_date_start = current_time.replace(hour=0, minute=0, second=0, microsecond=0)
-        target_date_end = current_time.replace(hour=23, minute=59, second=59, microsecond=999999)
+        current_time = start_time
+        end_time_jst = end_time
         
         # If specific hours were requested, adjust the time range
         if 'start_hour' in locals() and start_hour is not None:
-            current_time = target_date_start.replace(hour=int(start_hour))
+            current_time = current_time.replace(hour=start_hour, minute=0)
             if 'end_hour' in locals() and end_hour is not None:
-                end_time_jst = target_date_start.replace(hour=int(end_hour))
+                end_time_jst = end_time_jst.replace(hour=end_hour, minute=0)
         
         print(f"Time range (JST): {current_time.strftime('%Y-%m-%d %H:%M')} - {end_time_jst.strftime('%Y-%m-%d %H:%M')}")
-        
-        # Sort events by start time
-        jst_events.sort(key=lambda x: x['start'])
-        print(f"\nProcessing {len(jst_events)} events in chronological order")
+        print(f"\nProcessing {len(events)} events in chronological order")
         
         # If no events, return the requested time range
-        if not jst_events:
+        if not events:
             print("No events found, returning requested time range")
             available_slots = [(current_time, end_time_jst)]
-            meaningful_slots = [(current_time, end_time_jst)]  # Also set meaningful_slots to avoid NoneType error
         else:
             # Find available slots between events
-            for event in jst_events:
+            for event in events:
                 print(f"\nChecking event: {event.get('summary')} from {event.get('calendar')}")
                 print(f"Event time: {event['start'].strftime('%Y-%m-%d %H:%M')} - {event['end'].strftime('%Y-%m-%d %H:%M')}")
                 
@@ -430,21 +541,15 @@ async def chat_schedule(request: ChatRequest):
         # Filter out slots shorter than 30 minutes and ensure they're within the requested time range
         meaningful_slots = []
         for start, end in available_slots:
-            # Clip the slot to the requested time range
-            start = max(start, current_time)
-            end = min(end, end_time_jst)
-            
-            if (end - start).total_seconds() >= 1800:
-                # Only include slots that fall within the target date and time range
-                if start.date() == target_date.date():
-                    meaningful_slots.append((start, end))
-                    print(f"Added meaningful slot: {start.strftime('%H:%M')} - {end.strftime('%H:%M')}")
+            if (end - start).total_seconds() >= 1800:  # 30 minutes = 1800 seconds
+                meaningful_slots.append((start, end))
+                print(f"Added meaningful slot: {start.strftime('%H:%M')} - {end.strftime('%H:%M')}")
         
         if not meaningful_slots:
             print("No meaningful slots found")
             return {"response": f"{month}月{day}日は空き時間がありません。"}
-        
-        # Format response
+            
+        # Format response in exact Japanese format
         response_lines = [f"{month}月{day}日"]
         for start, end in meaningful_slots:
             response_lines.append(f"{start.strftime('%H:%M')}〜{end.strftime('%H:%M')}")
