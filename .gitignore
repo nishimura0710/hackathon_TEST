@@ -1,0 +1,5 @@
+.env
+app/client_secrets.json
+__pycache__/
+app/__pycache__/
+poetry.lock
