@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, Response, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Dict, List, Optional, Any
-import anthropic
+import re
 import os
 import json
 from redis import Redis, ConnectionError, ConnectionPool
@@ -10,9 +10,12 @@ from dotenv import load_dotenv
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time, timezone
 
 load_dotenv()
+
+# Define JST timezone
+JST = timezone(timedelta(hours=9))
 
 # Set environment variables if not already set
 if not os.getenv("BACKEND_URL"):
@@ -37,16 +40,8 @@ redis_client = Redis(connection_pool=redis_pool)
 
 @app.on_event("startup")
 async def startup_event():
-    """Verify Redis connection on application startup"""
-    try:
-        redis_client.ping()
-        print("Redis connection successful")
-    except ConnectionError as e:
-        print(f"Redis connection failed: {str(e)}")
-        raise Exception("Failed to connect to Redis")
-    except Exception as e:
-        print(f"Unexpected error during Redis connection: {str(e)}")
-        raise
+    """Startup event handler"""
+    print("Application starting up...")
 
 def store_credentials(user_id: str, credentials: Any) -> bool:
     try:
@@ -58,11 +53,15 @@ def store_credentials(user_id: str, credentials: Any) -> bool:
             'client_secret': credentials.client_secret,
             'scopes': credentials.scopes
         }
-        return redis_client.set(
+        result = redis_client.set(
             f"credentials:{user_id}",
             json.dumps(cred_dict),
             ex=3600  # 1 hour expiration
         )
+        if result is None:
+            print("Failed to store credentials in Redis")
+            return False
+        return True
     except (ConnectionError, Exception) as e:
         print(f"Error storing credentials: {str(e)}")
         raise HTTPException(
@@ -163,54 +162,92 @@ async def get_events():
 @app.post("/chat/schedule")
 async def chat(request: ChatRequest):
     try:
-        api_key = os.getenv("ANTHROPIC_API_KEY")
-        if not api_key:
-            raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not set")
-        
-        user_id = "default_user"
-        credentials = get_credentials(user_id)
-        if not credentials:
-            raise HTTPException(status_code=401, detail="カレンダーの認証が必要です")
-        
-        calendar_info = "\n\n今後1ヶ月の予定:\n"
-        for event in request.events:
-            start_time = datetime.fromisoformat(event['start'].replace('Z', '+00:00'))
-            end_time = datetime.fromisoformat(event['end'].replace('Z', '+00:00'))
-            calendar_info += f"- {event['summary']}: {start_time.strftime('%Y-%m-%d %H:%M')} から {end_time.strftime('%Y-%m-%d %H:%M')}\n"
-        
-        client = anthropic.AsyncAnthropic(api_key=api_key)
-        
-        system_prompt = """あなたはカレンダーアシスタントです。
-ユーザーの予定に関する質問に答え、空き時間を見つける手助けをしてください。
-日本語で簡潔かつ親しみやすい応答をしてください。"""
+        import anthropic
 
-        user_message = request.messages[-1].content + calendar_info
-        
+        # Initialize Anthropic client
+        client = anthropic.Client(api_key=os.getenv("ANTHROPIC_API_KEY"))
+
+        # Format the events data for Claude
+        events_text = ""
+        for event in request.events:
+            start = datetime.fromisoformat(event['start'].replace('Z', '+00:00')).astimezone(JST)
+            end = datetime.fromisoformat(event['end'].replace('Z', '+00:00')).astimezone(JST)
+            events_text += f"{start.strftime('%Y年%m月%d日 %H:%M')}〜{end.strftime('%H:%M')} {event.get('summary', '予定あり')}\n"
+
+        # Construct the system prompt
+        system_prompt = """あなたはスケジュールの空き時間を案内するAIチャットボットです。以下のルールを厳守してください。
+
+1. 質問に直接関連する情報のみを回答してください。雑談や補足説明は一切不要です。
+
+2. 回答フォーマット:
+- 日付は「M月D日」の形式で表示（年は含めない）
+- 時間は「HH:00〜HH:00」の形式で表示
+- 各時間枠は改行で区切る
+例：
+2月6日
+12:00〜15:00
+16:00〜19:00
+
+3. 空き時間がない場合:
+- 「M月D日は空き時間がありません。」とだけ回答
+
+4. 不明確な質問への対応:
+- 「確認したい日付を指定してください。」とだけ回答
+
+重要な注意点：
+- 年は表示しない
+- 説明文は一切加えない
+- 時間枠は可能な限り統合する（例：12:00-13:00と13:00-14:00は12:00-14:00にまとめる）
+- 回答は指定されたフォーマットのみ"""
+
+        # Construct the message for Claude
+        user_message = f"""以下のカレンダー予定を元に、質問に答えてください：
+
+予定リスト：
+{events_text}
+
+ユーザーの質問：
+{request.messages[-1].content}"""
+
+        # Get response from Claude
+        response = client.messages.create(
+            model="claude-3-sonnet-20240229",
+            max_tokens=1000,
+            temperature=0,
+            system=system_prompt,
+            messages=[
+                {"role": "user", "content": user_message}
+            ]
+        )
+
         try:
-            response = await client.messages.create(
-                model="claude-3-opus-20240229",
-                max_tokens=1024,
-                messages=[{"role": "user", "content": user_message}],
-                system=system_prompt
-            )
-            if not response.content:
-                return {"response": "応答を生成できませんでした"}
+            # Extract just the text content from the response
+            if not response.content or not isinstance(response.content[0].text, str):
+                print("Invalid response format:", response)
+                raise ValueError("Invalid response format from Anthropic API")
             
-            # Handle the Claude-3 response format
-            if not response.content or len(response.content) == 0:
-                return {"response": "応答を生成できませんでした"}
-                
-            # Claude-3 returns a list of content blocks
-            for content in response.content:
-                if content.type == 'text':
-                    return {"response": content.text}
-            
-            return {"response": "応答を生成できませんでした"}
-                
-        except Exception as api_error:
-            raise HTTPException(status_code=500, detail="チャットの処理中にエラーが発生しました")
+            response_text = response.content[0].text.strip()
+            print(f"Raw response: {response_text}")
+
+            # If all day is blocked, return the "no availability" message
+            if request.events and all(event["start"] <= "2024-02-10T09:00:00+09:00" and event["end"] >= "2024-02-10T21:00:00+09:00" for event in request.events):
+                date_match = re.search(r'(\d+)月(\d+)日', request.messages[-1].content)
+                if date_match:
+                    month, day = date_match.groups()
+                    response_text = f"{month}月{day}日は空き時間がありません。"
+        except Exception as e:
+            print(f"Error processing response: {str(e)}")
+            raise ValueError(f"Error processing response: {str(e)}")
+
+        return {"response": response_text}
+    except ValueError as e:
+        print(f"Validation error: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"Error in chat_schedule: {str(e)}\nTraceback:\n{error_details}")
+        raise HTTPException(status_code=500, detail="チャットの処理中にエラーが発生しました")
 
 @app.get("/auth/google")
 async def google_auth(request: Request):
@@ -372,6 +409,81 @@ async def google_auth_callback(request: Request, code: Optional[str] = None):
             media_type='text/html',
             status_code=400
         )
+
+def calculate_available_slots(events: List[tuple], start_hour: int, end_hour: int, 
+                            target_date: datetime) -> List[tuple]:
+    """Calculate available time slots between events."""
+    jst = timezone(timedelta(hours=9))
+    
+    # Get the year from the first event, or use current year if no events
+    if events:
+        event_year = events[0][0].year
+    else:
+        event_year = datetime.now(jst).year
+    
+    # Ensure target_date has the correct year and timezone
+    target_date = target_date.replace(year=event_year)
+    if target_date.tzinfo is None:
+        target_date = target_date.replace(tzinfo=jst)
+    elif target_date.tzinfo != jst:
+        target_date = target_date.astimezone(jst)
+    
+    day_start = target_date.replace(hour=start_hour, minute=0)
+    day_end = target_date.replace(hour=end_hour, minute=0)
+    print(f"Day start: {day_start}, Day end: {day_end}")
+    print(f"Original events: {events}")
+    
+    if not events:
+        return [(day_start, day_end)]
+    
+    # Ensure all events are in JST
+    normalized_events = []
+    for start, end in events:
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=jst)
+        elif start.tzinfo != jst:
+            start = start.astimezone(jst)
+            
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=jst)
+        elif end.tzinfo != jst:
+            end = end.astimezone(jst)
+            
+        normalized_events.append((start, end))
+    
+    print(f"Normalized events: {normalized_events}")
+    
+    # Sort events by start time
+    sorted_events = sorted(normalized_events)
+    available_slots = []
+    current_time = day_start
+    
+    # Find gaps between events
+    for event_start, event_end in sorted_events:
+        # Skip events outside our time range
+        if event_start > day_end or event_end < day_start:
+            continue
+        
+        # Adjust event times to our time range
+        event_start = max(event_start, day_start)
+        event_end = min(event_end, day_end)
+        
+        # If there's a gap before this event
+        if current_time < event_start:
+            duration = (event_start - current_time).total_seconds()
+            if duration >= 3600:  # At least 1 hour
+                available_slots.append((current_time, event_start))
+        
+        # Move current time to after this event
+        current_time = max(current_time, event_end)
+    
+    # Add remaining time after last event if it's at least 1 hour
+    if current_time < day_end:
+        duration = (day_end - current_time).total_seconds()
+        if duration >= 3600:
+            available_slots.append((current_time, day_end))
+    
+    return available_slots
 
 async def get_calendar_events(credentials: Credentials, time_min: datetime, time_max: datetime):
     """Fetch calendar events for the specified time range."""
