@@ -71,28 +71,32 @@ def mock_calendar_service(monkeypatch):
 
 JST = ZoneInfo("Asia/Tokyo")
 
-def test_parse_datetime_jp_range():
+@pytest.mark.asyncio
+async def test_parse_datetime_jp_range():
     today = datetime.now(JST).replace(hour=0, minute=0, second=0, microsecond=0)
     
-    # Test basic time range
-    result = parse_datetime_jp("10時〜15時の空いてる時間に会議を入れて")
-    assert result is not None
-    start_time, end_time, title, is_range, intent = result
-    assert start_time.hour == 10
-    assert end_time.hour == 15
-    assert title == "会議"
-    assert is_range == True
-    assert intent == 'event_creation'
-    
-    # Test afternoon range
-    result = parse_datetime_jp("午後の空いてる時間に打ち合わせを入れて")
-    assert result is not None
-    start_time, end_time, title, is_range, intent = result
-    assert start_time.hour == 13
-    assert end_time.hour == 17
-    assert title == "打ち合わせ"
-    assert is_range == True
-    assert intent == 'event_creation'
+    with patch('app.chat.detect_intent_with_anthropic') as mock_detect:
+        # Test basic time range with event creation
+        mock_detect.return_value = ("event_creation", "会議")
+        result = await parse_datetime_jp("10時〜15時の空いてる時間に会議を入れて")
+        assert result is not None
+        start_time, end_time, title, is_range, intent = result
+        assert start_time.hour == 10
+        assert end_time.hour == 15
+        assert title == "会議"
+        assert is_range == True
+        assert intent == 'event_creation'
+        
+        # Test afternoon range with availability check
+        mock_detect.return_value = ("availability_check", "")
+        result = await parse_datetime_jp("午後の空いてる時間を教えて")
+        assert result is not None
+        start_time, end_time, title, is_range, intent = result
+        assert start_time.hour == 13
+        assert end_time.hour == 17
+        assert title == "会議"  # Default title
+        assert is_range == True
+        assert intent == 'availability_check'
 
 def test_find_available_slots():
     now = datetime.now(JST).replace(hour=9, minute=0, second=0, microsecond=0)
@@ -147,34 +151,57 @@ def test_business_hours_validation():
     assert len(slots) > 0
     assert slots[-1][1].hour == 17  # Should end at 17:00
 
-def test_availability_check():
-    result = parse_datetime_jp("2月8日の空き時間を教えて")
-    assert result is not None
-    _, _, _, _, intent = result
-    assert intent == 'availability_check'
-
-def test_event_creation():
-    result = parse_datetime_jp("2月8日の13時から15時に会議を入れて")
-    assert result is not None
-    _, _, _, _, intent = result
-    assert intent == 'event_creation'
+@pytest.mark.asyncio
+async def test_anthropic_intent_detection():
+    from app.chat import detect_intent_with_anthropic
+    
+    with patch('app.chat.anthropic_client.messages.create') as mock_create:
+        # Test availability check without registration
+        mock_message = AsyncMock()
+        mock_message.content = [{"type": "text", "text": '{"intent": "availability_check", "title": ""}'}]
+        mock_create.return_value = mock_message
+        mock_create.side_effect = None
+        intent, title = await detect_intent_with_anthropic("明日の空き時間を教えて")
+        assert intent == "availability_check"
+        assert title == "会議"  # Default title
+        
+        # Test event creation with explicit registration request
+        mock_message = AsyncMock()
+        mock_message.content = [{"type": "text", "text": '{"intent": "event_creation", "title": "打ち合わせ"}'}]
+        mock_create.return_value = mock_message
+        mock_create.side_effect = None
+        intent, title = await detect_intent_with_anthropic("明日の午後に打ち合わせを入れて")
+        assert intent == "event_creation"
+        assert title == "打ち合わせ"
+        
+        # Test error handling
+        mock_create.side_effect = Exception("API Error")
+        intent, title = await detect_intent_with_anthropic("明日の空き時間を教えて")
+        assert intent == "unknown"
+        assert title == "会議"  # Default title on error
 
 @pytest.mark.asyncio
 async def test_schedule_chat(mock_calendar_service):
-    with patch('app.chat.get_calendar_service', return_value=mock_calendar_service):
+    with patch('app.chat.get_calendar_service', return_value=mock_calendar_service), \
+         patch('app.chat.detect_intent_with_anthropic') as mock_detect:
         # Mock calendar service response
         mock_calendar_service.events().list().execute.return_value = {
             'items': []
         }
         mock_calendar_service.events().insert.return_value.execute.return_value = {'id': '123'}
         
-        # Test availability check
+        # Test availability check without registration suggestion
+        mock_detect.return_value = ("availability_check", "")
         response = await schedule_chat({"messages": [{"content": "10時〜15時の空き時間を教えて"}]})
         assert "以下の時間が空いています" in response['response']
+        assert "予定を登録" not in response['response']
+        assert "カレンダーに登録" not in response['response']
         
-        # Test event creation
-        response = await schedule_chat({"messages": [{"content": "10時〜15時に会議を入れて"}]})
+        # Test event creation only when explicitly requested
+        mock_detect.return_value = ("event_creation", "打ち合わせ")
+        response = await schedule_chat({"messages": [{"content": "10時〜15時に打ち合わせを入れて"}]})
         assert "予定を登録してよろしいですか" in response['response']
+        assert "打ち合わせ" in response['response']
         
         # Test when slot is occupied
         mock_calendar_service.events().list().execute.return_value = {
@@ -183,5 +210,21 @@ async def test_schedule_chat(mock_calendar_service):
                 'end': {'dateTime': datetime.now(JST).replace(hour=15).isoformat()}
             }]
         }
+        mock_detect.return_value = ("availability_check", "")
         response = await schedule_chat({"messages": [{"content": "10時〜15時の空き時間を教えて"}]})
         assert "空き時間が見つかりませんでした" in response['response']
+        
+        # Test multiple available slots without registration suggestion
+        mock_calendar_service.events().list().execute.return_value = {
+            'items': [{
+                'start': {'dateTime': datetime.now(JST).replace(hour=12).isoformat()},
+                'end': {'dateTime': datetime.now(JST).replace(hour=13).isoformat()}
+            }]
+        }
+        mock_detect.return_value = ("availability_check", "")
+        response = await schedule_chat({"messages": [{"content": "10時〜15時の空き時間を教えて"}]})
+        assert "以下の時間が空いています" in response['response']
+        assert "10:00" in response['response']
+        assert "13:00" in response['response']
+        assert "予定を登録" not in response['response']
+        assert "カレンダーに登録" not in response['response']

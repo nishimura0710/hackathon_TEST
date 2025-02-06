@@ -1,3 +1,4 @@
+import os
 from fastapi import APIRouter, HTTPException
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
@@ -7,9 +8,48 @@ from .redis_config import redis_client
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import logging
+import anthropic
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+# Initialize Anthropic client
+anthropic_client = anthropic.Client(api_key=os.getenv("ANTHROPIC_API_KEY"))
+
+async def detect_intent_with_anthropic(text: str) -> tuple[str, str]:
+    """Detect intent and extract title using Anthropic's API."""
+    try:
+        message = anthropic_client.messages.create(
+            model="claude-3-sonnet-20240229",
+            max_tokens=100,
+            messages=[{
+                "role": "user",
+                "content": f"""Analyze this Japanese text and determine if it's asking to:
+                1. Check calendar availability ("availability_check")
+                2. Create a calendar event ("event_creation")
+                Also extract any event title if present.
+                
+                Text: {text}
+                
+                Respond in JSON format:
+                {{"intent": "availability_check|event_creation", "title": "extracted_title_or_empty"}}"""
+            }]
+        )
+        
+        if isinstance(message.content, list) and len(message.content) > 0:
+            content = message.content[0]
+            if isinstance(content, dict) and "text" in content:
+                response = json.loads(content["text"])
+                intent = response["intent"]
+                title = response.get("title", "")
+                # Always use "会議" as default title if none provided
+                return intent, title if title else "会議"
+        
+        logger.error("Invalid response format from Anthropic API")
+        return "unknown", "会議"
+    except Exception as e:
+        logger.error(f"Error detecting intent with Anthropic: {str(e)}")
+        return "unknown", "会議"
 
 RESPONSES = {
     'GREETING': 'はい、予定の登録をお手伝いします。いつの予定を登録しますか？',
@@ -71,27 +111,17 @@ async def create_calendar_event(service, start_time: datetime, end_time: datetim
         logger.error(f"Error creating calendar event: {str(e)}", exc_info=True)
         return False
 
-def parse_datetime_jp(text: str) -> tuple[datetime, datetime, str, bool, str] | None:
+async def parse_datetime_jp(text: str) -> tuple[datetime, datetime, str, bool, str] | None:
     logger.info(f"Parsing datetime from text: {text}")
     now = datetime.now(ZoneInfo("Asia/Tokyo"))
     target_date = now.replace(hour=0, minute=0, second=0, microsecond=0)
     
-    # Detect intent first
-    intent = 'unknown'
-    # Check for event creation first since it's more specific
-    for pattern in INTENT_PATTERNS['event_creation']:
-        if re.search(pattern, text):
-            intent = 'event_creation'
-            break
-    # If no event creation intent found, check for availability check
-    if intent == 'unknown':
-        for pattern in INTENT_PATTERNS['availability_check']:
-            if re.search(pattern, text):
-                intent = 'availability_check'
-                break
-    # Default to availability check if no specific intent found
-    if intent == 'unknown':
-        intent = 'availability_check'
+    # Use Anthropic for intent detection and title extraction
+    intent, extracted_title = await detect_intent_with_anthropic(text)
+    
+    # If intent is unknown, default to availability check
+    if intent == "unknown":
+        intent = "availability_check"
     
     # First try to extract any date information
     date_match = re.search(r'(\d+)月(\d+)日', text)
@@ -118,15 +148,8 @@ def parse_datetime_jp(text: str) -> tuple[datetime, datetime, str, bool, str] | 
         start_time = target_date.replace(hour=13)  # 13:00
         end_time = target_date.replace(hour=17)    # 17:00
         
-        # Extract title
-        title = "会議"
-        # Remove date, time, and context words before extracting title
-        cleaned_text = re.sub(r'\d+月\d+日|午後の?|空いてる時間に?|の|に|のに', '', text)
-        title_match = re.search(r'(\S+?)を(?:入れて|登録して|予定して)', cleaned_text)
-        if title_match:
-            extracted = title_match.group(1).strip()
-            if extracted and not any(x in extracted for x in ['空いてる', '空き']):
-                title = extracted
+        # Use extracted title from Anthropic if available
+        title = extracted_title if extracted_title else "会議"
         
         logger.info(f"Afternoon request: {start_time.strftime('%Y-%m-%d %H:%M')} - {end_time.strftime('%Y-%m-%d %H:%M')}")
         return start_time, end_time, title, True, intent
@@ -141,29 +164,8 @@ def parse_datetime_jp(text: str) -> tuple[datetime, datetime, str, bool, str] | 
         start_time = target_date.replace(hour=max(9, min(start_hour, 17)))
         end_time = target_date.replace(hour=max(9, min(end_hour, 17)))
         
-        # Extract title
-        title = "会議"
-        # First clean up the text by removing date/time patterns
-        cleaned_text = re.sub(r'\d+月\d+日の午後に|\d+月\d+日に|の午後に|午後に|の午後|午後', '', text)
-        
-        # Then extract the core title using a more precise pattern
-        title_match = re.search(r'([^を\s]+?)を(?:入れて|登録して|予定して)', cleaned_text)
-        if title_match:
-            extracted = title_match.group(1).strip()
-            # Only use the extracted title if it's not a time-related word and not empty
-            if extracted and not any(x in extracted for x in ['空いてる', '空き']):
-                # Remove any remaining particles by splitting on particles and taking the last non-particle part
-                # First remove any leading particles
-                extracted = re.sub(r'^(の|に|のに)', '', extracted)
-                # Then remove any trailing particles
-                extracted = re.sub(r'(の|に|のに)$', '', extracted)
-                # Finally, if there are still particles in the middle, split and take the last meaningful part
-                if re.search(r'(の|に|のに)', extracted):
-                    parts = re.split(r'(の|に|のに)', extracted)
-                    meaningful_parts = [p.strip() for p in parts if p.strip() and p not in ['の', 'に', 'のに']]
-                    if meaningful_parts:
-                        extracted = meaningful_parts[-1]
-                title = extracted.strip()
+        # Use extracted title from Anthropic if available
+        title = extracted_title if extracted_title else "会議"
         
         return start_time, end_time, title, True, intent
     
@@ -224,16 +226,8 @@ def parse_datetime_jp(text: str) -> tuple[datetime, datetime, str, bool, str] | 
                     logger.info(f"Requested time outside business hours: {start_hour}:00-{end_hour}:00")
                     return None
 
-                # Extract event title if present, default to "会議"
-                title = "会議"
-                # First remove all date/time/context patterns
-                cleaned_text = re.sub(r'\d+月\d+日|\d+時(?:から|〜|～)\d+時(?:まで)?|午後の?|空いてる時間に?|の|に|で|から|まで', '', text)
-                # Then extract title
-                title_match = re.search(r'(\S+?)(?:を)?(?:入れて|登録して|予定して)', cleaned_text)
-                if title_match and title_match.group(1):
-                    extracted = title_match.group(1).strip()
-                    if extracted and not any(x in extracted for x in ['空いてる', '空き']):
-                        title = extracted
+                # Use extracted title from Anthropic if available
+                title = extracted_title if extracted_title else "会議"
                 
                 # Check if this is a range request (〜 or から)
                 is_range = '〜' in text or '～' in text or 'から' in text
@@ -248,10 +242,13 @@ def format_available_slots(slots: list[tuple[datetime, datetime]]) -> str:
     """Format a list of time slots into a numbered list with proper Japanese formatting."""
     formatted = []
     for i, (start, end) in enumerate(slots, 1):
+        # Round minutes to nearest hour for cleaner display
+        start_rounded = start.replace(minute=0)
+        end_rounded = end.replace(minute=0)
         if start.date() == end.date():
-            formatted.append(f"{i}. {start.strftime('%H:%M')}〜{end.strftime('%H:%M')}")
+            formatted.append(f"{i}. {start_rounded.strftime('%H:%M')}〜{end_rounded.strftime('%H:%M')}")
         else:
-            formatted.append(f"{i}. {start.strftime('%m月%d日(%a) %H:%M')}〜{end.strftime('%m月%d日(%a) %H:%M')}")
+            formatted.append(f"{i}. {start_rounded.strftime('%m月%d日(%a) %H:%M')}〜{end_rounded.strftime('%m月%d日(%a) %H:%M')}")
     return '\n'.join(formatted)
 
 def find_available_slots(events: list, start_time: datetime, end_time: datetime, 
@@ -452,7 +449,7 @@ async def schedule_chat(message: dict):
             return {"response": f"{start.strftime('%m月%d日 %H:%M')}から{end.strftime('%H:%M')}で{title}の予定を登録してよろしいですか？（はい/いいえ）"}
         
         # Try to parse date/time from message
-        parsed = parse_datetime_jp(user_message)
+        parsed = await parse_datetime_jp(user_message)
         if parsed:
             start_time, end_time, title, is_range, intent = parsed
             logger.info(f"Successfully parsed datetime: {start_time} - {end_time} for {title} (is_range={is_range})")
