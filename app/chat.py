@@ -37,6 +37,85 @@ async def create_calendar_event(service, start_time: datetime, end_time: datetim
         return False
 
 def parse_datetime_jp(text: str) -> tuple[datetime, datetime, str, bool] | None:
+    logger.info(f"Parsing datetime from text: {text}")
+    now = datetime.now(ZoneInfo("Asia/Tokyo"))
+    target_date = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    
+    # First try to extract any date information
+    date_match = re.search(r'(\d+)月(\d+)日', text)
+    if date_match:
+        month = int(date_match.group(1))
+        day = int(date_match.group(2))
+        year = now.year
+        
+        try:
+            target_date = datetime(year, month, day, 
+                                 tzinfo=ZoneInfo("Asia/Tokyo"))
+            # If date is in past, assume next year
+            if target_date < now:
+                target_date = datetime(year + 1, month, day, 
+                                     tzinfo=ZoneInfo("Asia/Tokyo"))
+            logger.info(f"Found date: {target_date.strftime('%Y-%m-%d')}")
+        except ValueError:
+            logger.error(f"Invalid date: month={month}, day={day}")
+            return None
+    
+    # Handle afternoon range
+    afternoon_match = re.search(r'午後の?', text)
+    if afternoon_match:
+        start_time = target_date.replace(hour=13)  # 13:00
+        end_time = target_date.replace(hour=17)    # 17:00
+        
+        # Extract title
+        title = "会議"
+        # Remove date, time, and context words before extracting title
+        cleaned_text = re.sub(r'\d+月\d+日|午後の?|空いてる時間に?|の|に|のに', '', text)
+        title_match = re.search(r'(\S+?)を(?:入れて|登録して|予定して)', cleaned_text)
+        if title_match:
+            extracted = title_match.group(1).strip()
+            if extracted and not any(x in extracted for x in ['空いてる', '空き']):
+                title = extracted
+        
+        logger.info(f"Afternoon request: {start_time.strftime('%Y-%m-%d %H:%M')} - {end_time.strftime('%Y-%m-%d %H:%M')}")
+        return start_time, end_time, title, True
+    
+    # Handle simple time range
+    time_range_match = re.search(r'(\d{1,2})時[〜～](\d{1,2})時', text)
+    if time_range_match:
+        start_hour = int(time_range_match.group(1))
+        end_hour = int(time_range_match.group(2))
+        
+        # Create datetime objects with the specified hours
+        start_time = target_date.replace(hour=max(9, min(start_hour, 17)))
+        end_time = target_date.replace(hour=max(9, min(end_hour, 17)))
+        
+        # Extract title
+        title = "会議"
+        # First clean up the text by removing date/time patterns
+        cleaned_text = re.sub(r'\d+月\d+日の午後に|\d+月\d+日に|の午後に|午後に|の午後|午後', '', text)
+        
+        # Then extract the core title using a more precise pattern
+        title_match = re.search(r'([^を\s]+?)を(?:入れて|登録して|予定して)', cleaned_text)
+        if title_match:
+            extracted = title_match.group(1).strip()
+            # Only use the extracted title if it's not a time-related word and not empty
+            if extracted and not any(x in extracted for x in ['空いてる', '空き']):
+                # Remove any remaining particles by splitting on particles and taking the last non-particle part
+                # First remove any leading particles
+                extracted = re.sub(r'^(の|に|のに)', '', extracted)
+                # Then remove any trailing particles
+                extracted = re.sub(r'(の|に|のに)$', '', extracted)
+                # Finally, if there are still particles in the middle, split and take the last meaningful part
+                if re.search(r'(の|に|のに)', extracted):
+                    parts = re.split(r'(の|に|のに)', extracted)
+                    meaningful_parts = [p.strip() for p in parts if p.strip() and p not in ['の', 'に', 'のに']]
+                    if meaningful_parts:
+                        extracted = meaningful_parts[-1]
+                title = extracted.strip()
+        
+        return start_time, end_time, title, True
+    
+    # Handle patterns with dates
     patterns = [
         r'(\d+)月(\d+)日の(\d+)(?:時|:00)から(\d+)(?:時|:00)',  # 2月7日の13時から15時
         r'(\d+)月(\d+)日(\d+):(\d+)から(\d+):(\d+)',  # 2月7日13:00から15:00
@@ -64,15 +143,11 @@ def parse_datetime_jp(text: str) -> tuple[datetime, datetime, str, bool] | None:
                     end_minute = int(groups[5])
                 
                 now = datetime.now(ZoneInfo("Asia/Tokyo"))
-                year = now.year
+                # Use target_date's year which already handles past dates
+                start_time = datetime(target_date.year, month, day, start_hour, start_minute, tzinfo=ZoneInfo("Asia/Tokyo"))
+                end_time = datetime(target_date.year, month, day, end_hour, end_minute, tzinfo=ZoneInfo("Asia/Tokyo"))
                 
-                start_time = datetime(year, month, day, start_hour, start_minute, tzinfo=ZoneInfo("Asia/Tokyo"))
-                end_time = datetime(year, month, day, end_hour, end_minute, tzinfo=ZoneInfo("Asia/Tokyo"))
-                
-                # If date is in past, assume next year
-                if start_time < now:
-                    start_time = datetime(year + 1, month, day, start_hour, start_minute, tzinfo=ZoneInfo("Asia/Tokyo"))
-                    end_time = datetime(year + 1, month, day, end_hour, end_minute, tzinfo=ZoneInfo("Asia/Tokyo"))
+                logger.info(f"Explicit time range: {start_time.strftime('%Y-%m-%d %H:%M')} - {end_time.strftime('%Y-%m-%d %H:%M')}")
                 
                 # Validate business hours (9:00-17:00)
                 if start_hour < 9 or start_hour > 17 or end_hour < 9 or end_hour > 17:
@@ -80,8 +155,15 @@ def parse_datetime_jp(text: str) -> tuple[datetime, datetime, str, bool] | None:
                     return None
 
                 # Extract event title if present, default to "会議"
-                title_match = re.search(r'(.*?)(?:を|で|に)(?:入れて|登録して|予定して)', text)
-                title = title_match.group(1) if title_match else "会議"
+                title = "会議"
+                # First remove all date/time/context patterns
+                cleaned_text = re.sub(r'\d+月\d+日|\d+時(?:から|〜|～)\d+時(?:まで)?|午後の?|空いてる時間に?|の|に|で|から|まで', '', text)
+                # Then extract title
+                title_match = re.search(r'(\S+?)(?:を)?(?:入れて|登録して|予定して)', cleaned_text)
+                if title_match and title_match.group(1):
+                    extracted = title_match.group(1).strip()
+                    if extracted and not any(x in extracted for x in ['空いてる', '空き']):
+                        title = extracted
                 
                 # Check if this is a range request (〜 or から)
                 is_range = '〜' in text or '～' in text or 'から' in text
@@ -98,38 +180,55 @@ def find_longest_available_slot(events: list, start_time: datetime, end_time: da
         start_time = start_time.replace(hour=9, minute=0)
     if end_time.hour > 17:
         end_time = end_time.replace(hour=17, minute=0)
+    
+    if start_time >= end_time:
+        return None
         
     sorted_events = sorted(events, key=lambda x: datetime.fromisoformat(x['start'].get('dateTime', x['start'].get('date'))))
     
-    longest_slot_start = None
-    longest_slot_end = None
-    longest_duration = timedelta(hours=0)
+    # If there are no events, return the entire range
+    if not events:
+        return (start_time, end_time)
     
+    # Initialize variables for finding the longest slot
+    longest_duration = timedelta(hours=0)
+    longest_slot = None
     current = start_time
+    
+    # Check each potential slot between events
     for event in sorted_events:
         event_start = datetime.fromisoformat(event['start'].get('dateTime', event['start'].get('date')))
         event_end = datetime.fromisoformat(event['end'].get('dateTime', event['end'].get('date')))
         
-        if current < event_start and event_start > start_time:
-            slot_end = min(event_start, end_time)
-            duration = slot_end - current
+        # Skip events that end before our start time
+        if event_end <= start_time:
+            continue
+            
+        # If event starts after our end time, we're done
+        if event_start >= end_time:
+            break
+            
+        # If there's a gap before this event
+        if current < event_start:
+            duration = event_start - current
             if duration > longest_duration:
                 longest_duration = duration
-                longest_slot_start = current
-                longest_slot_end = slot_end
+                longest_slot = (current, event_start)
         
+        # Move current pointer past this event
         current = max(current, event_end)
-        if current >= end_time:
-            break
     
     # Check final slot after last event
     if current < end_time:
         duration = end_time - current
         if duration > longest_duration:
-            longest_slot_start = current
-            longest_slot_end = end_time
+            longest_slot = (current, end_time)
     
-    return (longest_slot_start, longest_slot_end) if longest_slot_start else None
+    # If no slot found yet, check if there's space after the last event
+    if not longest_slot and current < end_time:
+        longest_slot = (current, end_time)
+    
+    return longest_slot
 
 def get_calendar_service():
     try:
@@ -212,15 +311,29 @@ async def schedule_chat(message: dict):
             if is_range:
                 logger.info(f"Looking for longest available slot between {start_time} and {end_time}")
                 slot = find_longest_available_slot(events, start_time, end_time)
-                if slot:
+                if slot and (slot[1] - slot[0]) >= timedelta(hours=1):
                     slot_start, slot_end = slot
                     logger.info(f"Found longest available slot: {slot_start} to {slot_end}")
-                    if await create_calendar_event(service, slot_start, slot_end, title):
-                        return {
-                            "response": f"{slot_start.strftime('%m月%d日 %H:%M')}から{slot_end.strftime('%H:%M')}まで{title}を登録しました"
-                        }
+                    
+                    # Check if the slot overlaps with any events
+                    has_conflict = False
+                    for event in events:
+                        event_start = datetime.fromisoformat(event['start'].get('dateTime', event['start'].get('date')))
+                        event_end = datetime.fromisoformat(event['end'].get('dateTime', event['end'].get('date')))
+                        if (slot_start < event_end and slot_end > event_start):
+                            has_conflict = True
+                            break
+                    
+                    if not has_conflict:
+                        if await create_calendar_event(service, slot_start, slot_end, title):
+                            return {
+                                "response": f"{slot_start.strftime('%m月%d日 %H:%M')}から{slot_end.strftime('%H:%M')}まで{title}を登録しました"
+                            }
+                        else:
+                            return {"response": "予定の登録に失敗しました。もう一度お試しください。"}
                     else:
-                        return {"response": "予定の登録に失敗しました。もう一度お試しください。"}
+                        logger.info("Found slot has conflicts with existing events")
+                        return {"response": f"{start_time.strftime('%m月%d日')}の{start_time.strftime('%H:%M')}から{end_time.strftime('%H:%M')}の間に空き時間が見つかりませんでした。"}
                 else:
                     logger.info("No available slots found in the requested time range")
                     # Find all available slots in the time range
