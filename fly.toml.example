@@ -1,0 +1,50 @@
+app = "backend-app-example"
+primary_region = "sea"
+
+[build]
+
+[env]
+  BACKEND_URL = "https://your-backend-url.fly.dev"
+  FRONTEND_URL = "https://your-frontend-url.com"
+  PORT = "8000"
+  # Redis configuration (set these using flyctl secrets set)
+  # REDIS_HOST
+  # REDIS_PORT
+  # REDIS_PASSWORD
+  # REDIS_SSL
+  # REDIS_TLS
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = true
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+  [http_service.concurrency]
+    type = "connections"
+    hard_limit = 1000
+    soft_limit = 500
+
+[checks]
+  [checks.health]
+    port = 8000
+    type = "http"
+    interval = "15s"
+    timeout = "10s"
+    grace_period = "30s"
+    method = "GET"
+    path = "/api/health"
+    protocol = "http"
+
+[[vm]]
+  memory = "1gb"
+  cpu_kind = "shared"
+  cpus = 1
+  [vm.network]
+    enable_ipv6 = true
+    [vm.network.outbound]
+      via = ["public-ipv4", "public-ipv6"]
+    [vm.network.private]
+      ips = ["fdaa:f:2045:0:1::2"]

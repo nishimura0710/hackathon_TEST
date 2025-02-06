@@ -1,0 +1,26 @@
+# flyctl launch added from .gitignore
+**/.env
+**/.env.*
+**/*.env
+**/app/client_secrets.json
+**/**/__pycache__
+**/*.pyc
+**/poetry.lock
+**/test_redis.py
+**/redis_test_remote.py
+**/.pytest_cache
+**/.coverage
+**/htmlcov
+**/.secrets
+**/*.log
+**/.DS_Store
+**/fly.toml
+**/*.pem
+**/*.key
+**/*.crt
+**/.env.local
+**/.env.development
+**/.env.production
+**/credentials.json
+**/token.json
+**/secrets

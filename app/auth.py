@@ -1,5 +1,5 @@
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, JSONResponse
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
@@ -7,9 +7,35 @@ import json
 from .redis_config import redis_client
 import os
 import logging
+import secrets
+import subprocess
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+@router.get("/fly/auth")
+async def fly_auth():
+    try:
+        # Generate a unique state token
+        state = secrets.token_urlsafe(16)
+        
+        # Run flyctl auth login to get the auth URL
+        result = subprocess.run(['flyctl', 'auth', 'login'], capture_output=True, text=True)
+        auth_url = None
+        
+        # Parse the output to find the auth URL
+        for line in result.stdout.split('\n'):
+            if 'https://fly.io/app/auth/cli/' in line:
+                auth_url = line.strip()
+                break
+        
+        if auth_url:
+            return JSONResponse({"auth_url": auth_url})
+        else:
+            raise HTTPException(status_code=500, detail="認証URLの取得に失敗しました")
+    except Exception as e:
+        logger.error(f"Fly.io auth error: {str(e)}")
+        raise HTTPException(status_code=500, detail="認証処理に失敗しました")
 
 SCOPES = [
     'https://www.googleapis.com/auth/calendar.readonly',
