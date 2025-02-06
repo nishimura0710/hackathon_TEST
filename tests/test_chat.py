@@ -13,10 +13,21 @@ sys.path.append(str(Path(__file__).parent.parent))
 
 # Create mock redis_config module
 class MockRedisClient:
+    def __init__(self):
+        self.data = {}
+    
     def get(self, key):
-        return None
+        return self.data.get(key)
+    
     def set(self, key, value, ex=None):
-        pass
+        self.data[key] = value
+        return True
+    
+    def delete(self, *keys):
+        for key in keys:
+            if key in self.data:
+                del self.data[key]
+        return True
 
 mock_redis_client = MockRedisClient()
 
@@ -66,20 +77,22 @@ def test_parse_datetime_jp_range():
     # Test basic time range
     result = parse_datetime_jp("10時〜15時の空いてる時間に会議を入れて")
     assert result is not None
-    start_time, end_time, title, is_range = result
+    start_time, end_time, title, is_range, intent = result
     assert start_time.hour == 10
     assert end_time.hour == 15
     assert title == "会議"
     assert is_range == True
+    assert intent == 'event_creation'
     
     # Test afternoon range
     result = parse_datetime_jp("午後の空いてる時間に打ち合わせを入れて")
     assert result is not None
-    start_time, end_time, title, is_range = result
+    start_time, end_time, title, is_range, intent = result
     assert start_time.hour == 13
     assert end_time.hour == 17
     assert title == "打ち合わせ"
     assert is_range == True
+    assert intent == 'event_creation'
 
 def test_find_available_slots():
     now = datetime.now(JST).replace(hour=9, minute=0, second=0, microsecond=0)
@@ -134,6 +147,18 @@ def test_business_hours_validation():
     assert len(slots) > 0
     assert slots[-1][1].hour == 17  # Should end at 17:00
 
+def test_availability_check():
+    result = parse_datetime_jp("2月8日の空き時間を教えて")
+    assert result is not None
+    _, _, _, _, intent = result
+    assert intent == 'availability_check'
+
+def test_event_creation():
+    result = parse_datetime_jp("2月8日の13時から15時に会議を入れて")
+    assert result is not None
+    _, _, _, _, intent = result
+    assert intent == 'event_creation'
+
 @pytest.mark.asyncio
 async def test_schedule_chat(mock_calendar_service):
     with patch('app.chat.get_calendar_service', return_value=mock_calendar_service):
@@ -143,9 +168,13 @@ async def test_schedule_chat(mock_calendar_service):
         }
         mock_calendar_service.events().insert.return_value.execute.return_value = {'id': '123'}
         
-        # Test scheduling in available slot
-        response = await schedule_chat({"messages": [{"content": "10時〜15時の空いてる時間に会議を入れて"}]})
-        assert "会議を登録しました" in response['response']
+        # Test availability check
+        response = await schedule_chat({"messages": [{"content": "10時〜15時の空き時間を教えて"}]})
+        assert "以下の時間が空いています" in response['response']
+        
+        # Test event creation
+        response = await schedule_chat({"messages": [{"content": "10時〜15時に会議を入れて"}]})
+        assert "予定を登録してよろしいですか" in response['response']
         
         # Test when slot is occupied
         mock_calendar_service.events().list().execute.return_value = {
@@ -154,5 +183,5 @@ async def test_schedule_chat(mock_calendar_service):
                 'end': {'dateTime': datetime.now(JST).replace(hour=15).isoformat()}
             }]
         }
-        response = await schedule_chat({"messages": [{"content": "10時〜15時の空いてる時間に会議を入れて"}]})
+        response = await schedule_chat({"messages": [{"content": "10時〜15時の空き時間を教えて"}]})
         assert "空き時間が見つかりませんでした" in response['response']
