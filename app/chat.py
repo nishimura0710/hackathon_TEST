@@ -11,6 +11,21 @@ import logging
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
+RESPONSES = {
+    'GREETING': 'はい、予定の登録をお手伝いします。いつの予定を登録しますか？',
+    'CONFIRM_SLOT': '{start}から{end}で{title}の予定を登録してよろしいですか？',
+    'SUCCESS': '{start}から{end}まで{title}を登録しました',
+    'NO_SLOTS': '{date}の指定された時間帯に空き時間が見つかりませんでした',
+    'MULTIPLE_SLOTS': '以下の時間帯が空いています：\n{slots}\nご希望の時間帯を教えてください',
+    'ERROR': '申し訳ありません。予定の登録に失敗しました',
+    'OUTSIDE_HOURS': '申し訳ありません。予定は営業時間内（9:00-17:00）でお願いします',
+    'CONFIRM': 'はい、かしこまりました。',
+    'INVALID_FORMAT': '申し訳ありません。日時の指定方法が正しくありません。\n例：2月7日の13時から15時に会議を入れて',
+    'ALREADY_BOOKED': 'その時間帯は既に予定が入っています。別の時間帯をお選びください。',
+    'ASK_DURATION': '何時間の予定を入れますか？',
+    'SUGGEST_TIME': '{date}の{slots}が空いています。この時間でよろしいですか？'
+}
+
 async def create_calendar_event(service, start_time: datetime, end_time: datetime, title: str) -> bool:
     try:
         event = {
@@ -174,61 +189,50 @@ def parse_datetime_jp(text: str) -> tuple[datetime, datetime, str, bool] | None:
     
     return None
 
-def find_longest_available_slot(events: list, start_time: datetime, end_time: datetime) -> tuple[datetime, datetime] | None:
-    """Find the longest continuous available time slot between start_time and end_time."""
+def format_available_slots(slots: list[tuple[datetime, datetime]]) -> str:
+    """Format a list of time slots into a numbered list with proper Japanese formatting."""
+    formatted = []
+    for i, (start, end) in enumerate(slots, 1):
+        if start.date() == end.date():
+            formatted.append(f"{i}. {start.strftime('%H:%M')}〜{end.strftime('%H:%M')}")
+        else:
+            formatted.append(f"{i}. {start.strftime('%m月%d日(%a) %H:%M')}〜{end.strftime('%m月%d日(%a) %H:%M')}")
+    return '\n'.join(formatted)
+
+def find_available_slots(events: list, start_time: datetime, end_time: datetime, 
+                        min_duration: timedelta = timedelta(hours=1)) -> list[tuple[datetime, datetime]]:
+    """Find all available time slots between start_time and end_time with minimum duration."""
     if start_time.hour < 9:
         start_time = start_time.replace(hour=9, minute=0)
     if end_time.hour > 17:
         end_time = end_time.replace(hour=17, minute=0)
     
     if start_time >= end_time:
-        return None
-        
+        return []
+    
+    available_slots = []
+    current = start_time
     sorted_events = sorted(events, key=lambda x: datetime.fromisoformat(x['start'].get('dateTime', x['start'].get('date'))))
     
-    # If there are no events, return the entire range
-    if not events:
-        return (start_time, end_time)
-    
-    # Initialize variables for finding the longest slot
-    longest_duration = timedelta(hours=0)
-    longest_slot = None
-    current = start_time
-    
-    # Check each potential slot between events
     for event in sorted_events:
         event_start = datetime.fromisoformat(event['start'].get('dateTime', event['start'].get('date')))
         event_end = datetime.fromisoformat(event['end'].get('dateTime', event['end'].get('date')))
         
-        # Skip events that end before our start time
         if event_end <= start_time:
             continue
-            
-        # If event starts after our end time, we're done
         if event_start >= end_time:
             break
             
-        # If there's a gap before this event
         if current < event_start:
             duration = event_start - current
-            if duration > longest_duration:
-                longest_duration = duration
-                longest_slot = (current, event_start)
-        
-        # Move current pointer past this event
+            if duration >= min_duration:
+                available_slots.append((current, event_start))
         current = max(current, event_end)
     
-    # Check final slot after last event
-    if current < end_time:
-        duration = end_time - current
-        if duration > longest_duration:
-            longest_slot = (current, end_time)
+    if current < end_time and (end_time - current) >= min_duration:
+        available_slots.append((current, end_time))
     
-    # If no slot found yet, check if there's space after the last event
-    if not longest_slot and current < end_time:
-        longest_slot = (current, end_time)
-    
-    return longest_slot
+    return available_slots
 
 def get_calendar_service():
     try:
@@ -293,6 +297,23 @@ async def schedule_chat(message: dict):
         service = get_calendar_service()
         user_message = message.get('messages', [{}])[-1].get('content', '')
         
+        # Check for confirmation of suggested slot
+        if '確認' in user_message or 'はい' in user_message:
+            pending_slot = json.loads(redis_client.get('pending_slot:default_user') or '{}')
+            if pending_slot:
+                if await create_calendar_event(service, 
+                    datetime.fromisoformat(pending_slot['start']),
+                    datetime.fromisoformat(pending_slot['end']),
+                    pending_slot['title']):
+                    redis_client.delete('pending_slot:default_user')
+                    return {"response": RESPONSES['SUCCESS'].format(
+                        start=datetime.fromisoformat(pending_slot['start']).strftime('%m月%d日 %H:%M'),
+                        end=datetime.fromisoformat(pending_slot['end']).strftime('%H:%M'),
+                        title=pending_slot['title']
+                    )}
+                return {"response": RESPONSES['ERROR']}
+            return {"response": RESPONSES['GREETING']}
+        
         # Try to parse date/time from message
         parsed = parse_datetime_jp(user_message)
         if parsed:
@@ -348,18 +369,48 @@ async def schedule_chat(message: dict):
                     if current < end_time:
                         available_slots.append((current, end_time))
                     
-                    response = f"{start_time.strftime('%m月%d日')}の{start_time.strftime('%H:%M')}から{end_time.strftime('%H:%M')}の間に空き時間が見つかりませんでした。\n"
+                    # Find all available slots
+                    available_slots = find_available_slots(events, start_time, end_time)
                     if available_slots:
-                        response += "以下の時間が空いています：\n"
-                        for start, end in available_slots:
-                            if start.date() == end.date():
-                                response += f"- {start.strftime('%m月%d日(%a) %H:%M')}〜{end.strftime('%H:%M')}\n"
-                            else:
-                                response += f"- {start.strftime('%m月%d日(%a) %H:%M')}〜{end.strftime('%m月%d日(%a) %H:%M')}\n"
-                    return {"response": response}
+                        slots_text = format_available_slots(available_slots)
+                        redis_client.set(
+                            'available_slots:default_user',
+                            json.dumps([(s[0].isoformat(), s[1].isoformat()) for s in available_slots]),
+                            ex=3600
+                        )
+                        return {"response": RESPONSES['MULTIPLE_SLOTS'].format(
+                            slots=slots_text
+                        )}
+                    
+                    return {"response": RESPONSES['NO_SLOTS'].format(
+                        date=start_time.strftime('%m月%d日')
+                    )}
             else:
                 logger.info("Not a range request, proceeding with standard slot finding")
         else:
+            # Check for slot selection
+            slot_number_match = re.search(r'^(\d+)番', user_message)
+            if slot_number_match:
+                slot_number = int(slot_number_match.group(1))
+                available_slots = json.loads(redis_client.get('available_slots:default_user') or '[]')
+                if available_slots and 1 <= slot_number <= len(available_slots):
+                    start, end = [datetime.fromisoformat(t) for t in available_slots[slot_number-1]]
+                    
+                    # Store the selected slot as pending
+                    pending_slot = {
+                        'start': start.isoformat(),
+                        'end': end.isoformat(),
+                        'title': '会議'  # Default title
+                    }
+                    redis_client.set('pending_slot:default_user', json.dumps(pending_slot), ex=3600)
+                    
+                    return {"response": RESPONSES['CONFIRM_SLOT'].format(
+                        start=start.strftime('%H:%M'),
+                        end=end.strftime('%H:%M'),
+                        title=pending_slot['title']
+                    )}
+                return {"response": RESPONSES['INVALID_FORMAT']}
+            
             logger.info("Could not parse datetime or time is outside business hours")
             
             # Extract date from message if possible
@@ -439,73 +490,45 @@ async def schedule_chat(message: dict):
                 
                 current += timedelta(hours=1)
             
-            # Find first available slot
-            current_time = start_time.replace(minute=0)
-            if current_time.hour < 9:
-                current_time = current_time.replace(hour=9)
-            if afternoon_request and current_time.hour < 13:
-                current_time = current_time.replace(hour=13)
+            # Find available slots considering afternoon request
+            start_hour = 13 if afternoon_request else 9
+            start_time = start_time.replace(hour=start_hour, minute=0)
+            end_time = start_time.replace(hour=17, minute=0)
             
-            logger.info(f"Looking for slots starting at {current_time} (afternoon_request={afternoon_request})")
-            sorted_events = sorted(events, key=lambda x: datetime.fromisoformat(x['start'].get('dateTime', x['start'].get('date'))))
-            logger.info(f"Found {len(sorted_events)} events for the day")
+            logger.info(f"Looking for slots between {start_time} and {end_time}")
+            available_slots = find_available_slots(events, start_time, end_time)
             
-            # Initialize variables for slot finding
-            available_slots = []
-            
-            # Check each time slot until we find one that's available
-            while current_time.hour < 17 and current_time.date() == start_time.date():
-                slot_end = current_time + timedelta(hours=1)
-                logger.info(f"Checking slot: {current_time} to {slot_end}")
+            if available_slots:
+                # Store available slots in Redis
+                slots_text = format_available_slots(available_slots)
+                redis_client.set(
+                    'available_slots:default_user',
+                    json.dumps([(s[0].isoformat(), s[1].isoformat()) for s in available_slots]),
+                    ex=3600
+                )
                 
-                # Skip if we're before business hours or before afternoon for afternoon requests
-                if current_time.hour < 9 or (afternoon_request and current_time.hour < 13):
-                    current_time = current_time.replace(hour=13 if afternoon_request else 9)
-                    logger.info(f"Adjusted time to {current_time} due to business hours/afternoon request")
-                    continue
+                # Take the first available slot and create the event
+                start_time, end_time = available_slots[0]
+                title = "会議"
+                title_match = re.search(r'(.*?)(?:を|で|に)(?:入れて|登録して|予定して)', user_message)
+                if title_match:
+                    title = title_match.group(1).strip()
                 
-                # Check if this slot conflicts with any event
-                slot_available = True
-                for event in sorted_events:
-                    event_start = datetime.fromisoformat(event['start'].get('dateTime', event['start'].get('date')))
-                    event_end = datetime.fromisoformat(event['end'].get('dateTime', event['end'].get('date')))
-                    
-                    # Check if the event overlaps with our current slot
-                    if (current_time < event_end and slot_end > event_start and
-                        event_start.date() == current_time.date()):
-                        slot_available = False
-                        logger.info(f"Slot conflicts with event: {event.get('summary')} ({event_start} to {event_end})")
-                        current_time = event_end
-                        if current_time.minute > 0:
-                            current_time = (current_time + timedelta(hours=1)).replace(minute=0)
-                        break
-                
-                if slot_available and current_time.hour < 17:
-                    logger.info(f"Found available slot: {current_time} to {slot_end}")
-                    available_slots.append((current_time, slot_end))
-                    
-                    # If this is a suitable slot for our request, create the event
-                    if not afternoon_request or (afternoon_request and current_time.hour >= 13):
-                        title = "会議"
-                        title_match = re.search(r'(.*?)(?:を|で|に)(?:入れて|登録して|予定して)', user_message)
-                        if title_match:
-                            title = title_match.group(1).strip()
-                        
-                        try:
-                            logger.info(f"Attempting to create event '{title}' at {current_time} to {slot_end}")
-                            if await create_calendar_event(service, current_time, slot_end, title):
-                                logger.info("Event creation successful")
-                                return {
-                                    "response": f"{current_time.strftime('%m月%d日 %H:%M')}から{slot_end.strftime('%H:%M')}まで{title}を登録しました"
-                                }
-                            else:
-                                logger.error("Event creation failed")
-                                return {"response": "予定の登録に失敗しました。もう一度お試しください。"}
-                        except Exception as e:
-                            logger.error(f"Error creating event: {str(e)}", exc_info=True)
-                            return {"response": "予定の登録に失敗しました。もう一度お試しください。"}
-                        
-                current_time += timedelta(hours=1)
+                try:
+                    logger.info(f"Attempting to create event '{title}' at {start_time} to {end_time}")
+                    if await create_calendar_event(service, start_time, end_time, title):
+                        logger.info("Event creation successful")
+                        return {"response": RESPONSES['SUCCESS'].format(
+                            start=start_time.strftime('%m月%d日 %H:%M'),
+                            end=end_time.strftime('%H:%M'),
+                            title=title
+                        )}
+                    else:
+                        logger.error("Event creation failed")
+                        return {"response": RESPONSES['ERROR']}
+                except Exception as e:
+                    logger.error(f"Error creating event: {str(e)}", exc_info=True)
+                    return {"response": RESPONSES['ERROR']}
                 
             # If we get here, we didn't find a suitable slot or failed to create the event
             if available_slots:
@@ -557,62 +580,43 @@ async def schedule_chat(message: dict):
                     response += f"- {start.strftime('%m月%d日(%a) %H:%M')}〜{end.strftime('%m月%d日(%a) %H:%M')}\n"
             return {"response": response}
         
-        # If no date/time found, return available slots
+        # If no date/time found, return available slots for the next 7 days
         now = datetime.now(ZoneInfo("Asia/Tokyo"))
+        week_end = now + timedelta(days=7)
+        
         events_result = service.events().list(
             calendarId='primary',
             timeMin=now.isoformat(),
-            timeMax=(now + timedelta(days=7)).isoformat(),
+            timeMax=week_end.isoformat(),
             singleEvents=True,
             orderBy='startTime'
         ).execute()
         
         events = events_result.get('items', [])
-        free_slots = []
-        current_time = now.replace(minute=0, second=0, microsecond=0)  # Round to hour
-        business_start = current_time.replace(hour=9)  # 9 AM
-        business_end = current_time.replace(hour=17)  # 5 PM
+        all_available_slots = []
         
-        for i in range(7):  # Next 7 days
-            day_start = business_start + timedelta(days=i)
-            day_end = business_end + timedelta(days=i)
+        # Check each day
+        for i in range(7):
+            day_start = (now + timedelta(days=i)).replace(hour=9, minute=0, second=0, microsecond=0)
+            day_end = day_start.replace(hour=17)
             
-            day_events = [
-                event for event in events
-                if datetime.fromisoformat(event['start'].get('dateTime', event['start'].get('date'))).date() == day_start.date()
-            ]
-            
-            current = day_start
-            for event in sorted(day_events, key=lambda x: datetime.fromisoformat(x['start'].get('dateTime', x['start'].get('date')))):
-                event_start = datetime.fromisoformat(event['start'].get('dateTime', event['start'].get('date')))
-                event_end = datetime.fromisoformat(event['end'].get('dateTime', event['end'].get('date')))
-                
-                if current < event_start and (event_start - current) >= timedelta(hours=1):
-                    free_slots.append({
-                        "start": current.isoformat(),
-                        "end": event_start.isoformat()
-                    })
-                current = max(current, event_end)
-            
-            if current < day_end and (day_end - current) >= timedelta(hours=1):
-                free_slots.append({
-                    "start": current.isoformat(),
-                    "end": day_end.isoformat()
-                })
+            # Get available slots for this day
+            day_slots = find_available_slots(events, day_start, day_end)
+            all_available_slots.extend(day_slots)
         
-        if not free_slots:
-            response = "申し訳ありませんが、来週の空き時間が見つかりませんでした。"
-        else:
-            response = "以下の時間が空いています：\n"
-            for slot in free_slots:
-                start = datetime.fromisoformat(slot['start'])
-                end = datetime.fromisoformat(slot['end'])
-                if start.date() == end.date():
-                    response += f"- {start.strftime('%m月%d日(%a) %H:%M')}〜{end.strftime('%H:%M')}\n"
-                else:
-                    response += f"- {start.strftime('%m月%d日(%a) %H:%M')}〜{end.strftime('%m月%d日(%a) %H:%M')}\n"
+        if not all_available_slots:
+            return {"response": "申し訳ありませんが、来週の空き時間が見つかりませんでした。"}
         
-        return {"response": response}
+        # Store all slots in Redis
+        redis_client.set(
+            'available_slots:default_user',
+            json.dumps([(s[0].isoformat(), s[1].isoformat()) for s in all_available_slots]),
+            ex=3600
+        )
+        
+        # Format and return the response
+        slots_text = format_available_slots(all_available_slots)
+        return {"response": RESPONSES['MULTIPLE_SLOTS'].format(slots=slots_text)}
     except HTTPException:
         raise
     except Exception as e:
