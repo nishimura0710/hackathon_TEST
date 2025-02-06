@@ -36,10 +36,12 @@ async def create_calendar_event(service, start_time: datetime, end_time: datetim
         logger.error(f"Error creating calendar event: {str(e)}", exc_info=True)
         return False
 
-def parse_datetime_jp(text: str) -> tuple[datetime, datetime, str] | None:
+def parse_datetime_jp(text: str) -> tuple[datetime, datetime, str, bool] | None:
     patterns = [
         r'(\d+)月(\d+)日の(\d+)(?:時|:00)から(\d+)(?:時|:00)',  # 2月7日の13時から15時
         r'(\d+)月(\d+)日(\d+):(\d+)から(\d+):(\d+)',  # 2月7日13:00から15:00
+        r'(\d+)月(\d+)日の(\d+)時〜(\d+)時',  # 2月7日の13時〜15時
+        r'(\d+)月(\d+)日(\d+)時～(\d+)時'  # 全角チルダ対応
     ]
     
     for pattern in patterns:
@@ -81,11 +83,53 @@ def parse_datetime_jp(text: str) -> tuple[datetime, datetime, str] | None:
                 title_match = re.search(r'(.*?)(?:を|で|に)(?:入れて|登録して|予定して)', text)
                 title = title_match.group(1) if title_match else "会議"
                 
-                return start_time, end_time, title
+                # Check if this is a range request (〜 or から)
+                is_range = '〜' in text or '～' in text or 'から' in text
+                
+                return start_time, end_time, title, is_range
             except (ValueError, AttributeError):
                 continue
     
     return None
+
+def find_longest_available_slot(events: list, start_time: datetime, end_time: datetime) -> tuple[datetime, datetime] | None:
+    """Find the longest continuous available time slot between start_time and end_time."""
+    if start_time.hour < 9:
+        start_time = start_time.replace(hour=9, minute=0)
+    if end_time.hour > 17:
+        end_time = end_time.replace(hour=17, minute=0)
+        
+    sorted_events = sorted(events, key=lambda x: datetime.fromisoformat(x['start'].get('dateTime', x['start'].get('date'))))
+    
+    longest_slot_start = None
+    longest_slot_end = None
+    longest_duration = timedelta(hours=0)
+    
+    current = start_time
+    for event in sorted_events:
+        event_start = datetime.fromisoformat(event['start'].get('dateTime', event['start'].get('date')))
+        event_end = datetime.fromisoformat(event['end'].get('dateTime', event['end'].get('date')))
+        
+        if current < event_start and event_start > start_time:
+            slot_end = min(event_start, end_time)
+            duration = slot_end - current
+            if duration > longest_duration:
+                longest_duration = duration
+                longest_slot_start = current
+                longest_slot_end = slot_end
+        
+        current = max(current, event_end)
+        if current >= end_time:
+            break
+    
+    # Check final slot after last event
+    if current < end_time:
+        duration = end_time - current
+        if duration > longest_duration:
+            longest_slot_start = current
+            longest_slot_end = end_time
+    
+    return (longest_slot_start, longest_slot_end) if longest_slot_start else None
 
 def get_calendar_service():
     try:
@@ -153,8 +197,55 @@ async def schedule_chat(message: dict):
         # Try to parse date/time from message
         parsed = parse_datetime_jp(user_message)
         if parsed:
-            start_time, end_time, title = parsed
-            logger.info(f"Successfully parsed datetime: {start_time} - {end_time} for {title}")
+            start_time, end_time, title, is_range = parsed
+            logger.info(f"Successfully parsed datetime: {start_time} - {end_time} for {title} (is_range={is_range})")
+            
+            events_result = service.events().list(
+                calendarId='primary',
+                timeMin=start_time.isoformat(),
+                timeMax=end_time.isoformat(),
+                singleEvents=True,
+                orderBy='startTime'
+            ).execute()
+            
+            events = events_result.get('items', [])
+            if is_range:
+                logger.info(f"Looking for longest available slot between {start_time} and {end_time}")
+                slot = find_longest_available_slot(events, start_time, end_time)
+                if slot:
+                    slot_start, slot_end = slot
+                    logger.info(f"Found longest available slot: {slot_start} to {slot_end}")
+                    if await create_calendar_event(service, slot_start, slot_end, title):
+                        return {
+                            "response": f"{slot_start.strftime('%m月%d日 %H:%M')}から{slot_end.strftime('%H:%M')}まで{title}を登録しました"
+                        }
+                    else:
+                        return {"response": "予定の登録に失敗しました。もう一度お試しください。"}
+                else:
+                    logger.info("No available slots found in the requested time range")
+                    # Find all available slots in the time range
+                    available_slots = []
+                    current = start_time
+                    for event in events:
+                        event_start = datetime.fromisoformat(event['start'].get('dateTime', event['start'].get('date')))
+                        if current < event_start:
+                            available_slots.append((current, event_start))
+                        current = datetime.fromisoformat(event['end'].get('dateTime', event['end'].get('date')))
+                    
+                    if current < end_time:
+                        available_slots.append((current, end_time))
+                    
+                    response = f"{start_time.strftime('%m月%d日')}の{start_time.strftime('%H:%M')}から{end_time.strftime('%H:%M')}の間に空き時間が見つかりませんでした。\n"
+                    if available_slots:
+                        response += "以下の時間が空いています：\n"
+                        for start, end in available_slots:
+                            if start.date() == end.date():
+                                response += f"- {start.strftime('%m月%d日(%a) %H:%M')}〜{end.strftime('%H:%M')}\n"
+                            else:
+                                response += f"- {start.strftime('%m月%d日(%a) %H:%M')}〜{end.strftime('%m月%d日(%a) %H:%M')}\n"
+                    return {"response": response}
+            else:
+                logger.info("Not a range request, proceeding with standard slot finding")
         else:
             logger.info("Could not parse datetime or time is outside business hours")
             
