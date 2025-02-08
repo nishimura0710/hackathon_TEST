@@ -24,7 +24,7 @@ cookie = SessionCookie(
     cookie_name=cookie_name,
     identifier="general_verifier",
     auto_error=True,
-    secret_key=os.getenv("SESSION_SECRET_KEY"),
+    secret_key=os.getenv("SESSION_SECRET_KEY", "default_secret_key"),
     cookie_params={"secure": True, "httponly": True, "samesite": "lax"}
 )
 
@@ -69,22 +69,25 @@ SCOPES = [
 ]
 
 def get_google_client_config():
-    required_env_vars = ["GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "BACKEND_URL", "FRONTEND_URL"]
-    missing_vars = [var for var in required_env_vars if not os.getenv(var)]
-    if missing_vars:
+    backend_url = os.getenv("BACKEND_URL", "https://hackathon-test.fly.dev")
+    frontend_url = os.getenv("FRONTEND_URL", "https://google-calendar-bot-lb7lm5oq.devinapps.com")
+    client_id = os.getenv("GOOGLE_CLIENT_ID")
+    client_secret = os.getenv("GOOGLE_CLIENT_SECRET")
+    
+    if not all([client_id, client_secret]):
         raise HTTPException(
             status_code=500,
-            detail=f"Missing required environment variables: {', '.join(missing_vars)}"
+            detail="Missing required environment variables"
         )
     
     return {
         "web": {
-            "client_id": os.getenv("GOOGLE_CLIENT_ID"),
-            "client_secret": os.getenv("GOOGLE_CLIENT_SECRET"),
+            "client_id": client_id,
+            "client_secret": client_secret,
             "auth_uri": "https://accounts.google.com/o/oauth2/auth",
             "token_uri": "https://oauth2.googleapis.com/token",
-            "redirect_uris": [f"{os.getenv('BACKEND_URL')}/auth/google/callback"],
-            "javascript_origins": [os.getenv("FRONTEND_URL")]
+            "redirect_uris": [f"{backend_url}/auth/google/callback"],
+            "javascript_origins": [frontend_url]
         }
     }
 
@@ -95,12 +98,13 @@ async def google_auth():
         flow = Flow.from_client_config(
             config,
             scopes=SCOPES,
-            redirect_uri=f"{os.getenv('BACKEND_URL')}/auth/google/callback"
+            redirect_uri=f"{os.getenv('BACKEND_URL', 'https://hackathon-test.fly.dev')}/auth/google/callback"
         )
         
         authorization_url, state = flow.authorization_url(
             access_type='offline',
-            include_granted_scopes='true'
+            include_granted_scopes='true',
+            prompt='consent'
         )
         
         return {"auth_url": authorization_url}
@@ -129,7 +133,7 @@ async def auth_callback(request: Request, code: str):
         flow = Flow.from_client_config(
             config,
             scopes=SCOPES,
-            redirect_uri=f"{os.getenv('BACKEND_URL')}/auth/google/callback"
+            redirect_uri=f"{os.getenv('BACKEND_URL', 'https://hackathon-test.fly.dev')}/auth/google/callback"
         )
         
         flow.fetch_token(code=code)
