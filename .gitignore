@@ -1,3 +1,27 @@
+# Environment variables
 .env
+.env.*
+!.env.example
+app/.env
+app/.env.*
+!app/.env.example
+
+# Python
 __pycache__/
+*.py[cod]
 poetry.lock
+
+# Node
+node_modules/
+.next/
+out/
+dist/
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# Secrets
+client_secrets.json
+**/client_secrets.json
