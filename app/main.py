@@ -18,17 +18,20 @@ class SessionData(BaseModel):
     id: UUID
     credentials: dict | None = None
 
-cookie_name = "calendar_session"
-backend = InMemoryBackend[UUID, SessionData]()
-cookie = SessionCookie(
-    cookie_name=cookie_name,
-    identifier="general_verifier",
-    auto_error=True,
-    secret_key=os.getenv("SESSION_SECRET_KEY", "default_secret_key"),
-    cookie_params={"secure": True, "httponly": True, "samesite": "lax"}
-)
+from fastapi.security import APIKeyCookie
+from starlette.middleware.sessions import SessionMiddleware
 
 app = FastAPI()
+
+# Add session middleware
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=os.getenv("SESSION_SECRET_KEY", "default_secret_key"),
+    session_cookie="calendar_session",
+    max_age=86400,  # 24 hours
+    same_site="lax",
+    https_only=True
+)
 
 # CORS設定
 FRONTEND_URLS = [
@@ -111,20 +114,10 @@ async def google_auth():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-async def get_session_data(
-    session_id: UUID = Depends(cookie)
-) -> SessionData:
-    try:
-        session = await backend.read(session_id)
-        if session is None:
-            raise HTTPException(status_code=401, detail="Session not found")
-        return session
-    except Exception as e:
-        raise HTTPException(status_code=401, detail="Invalid session")
-
 @app.get("/auth/status")
-async def auth_status(session_data: SessionData = Depends(get_session_data)):
-    return {"authenticated": session_data.credentials is not None}
+async def auth_status(request: Request):
+    credentials = request.session.get("credentials")
+    return {"authenticated": credentials is not None}
 
 @app.get("/auth/google/callback")
 async def auth_callback(request: Request, code: str):
@@ -139,20 +132,14 @@ async def auth_callback(request: Request, code: str):
         flow.fetch_token(code=code)
         credentials = flow.credentials
         
-        session_id = uuid4()
-        session_data = SessionData(
-            id=session_id,
-            credentials={
-                'token': credentials.token,
-                'refresh_token': credentials.refresh_token,
-                'token_uri': credentials.token_uri,
-                'client_id': credentials.client_id,
-                'client_secret': credentials.client_secret,
-                'scopes': credentials.scopes
-            }
-        )
-        
-        await backend.create(session_id, session_data)
+        request.session["credentials"] = {
+            'token': credentials.token,
+            'refresh_token': credentials.refresh_token,
+            'token_uri': credentials.token_uri,
+            'client_id': credentials.client_id,
+            'client_secret': credentials.client_secret,
+            'scopes': credentials.scopes
+        }
         
         return Response(
             content='''
@@ -174,19 +161,20 @@ class EventRequest(BaseModel):
 @app.post("/calendar/schedule")
 async def schedule_event(
     event_data: EventRequest,
-    session_data: SessionData = Depends(get_session_data)
+    request: Request
 ):
-    if not session_data.credentials:
+    stored_credentials = request.session.get("credentials")
+    if not stored_credentials:
         raise HTTPException(status_code=401, detail="認証が必要です")
     
     try:
         credentials = Credentials(
-            token=session_data.credentials['token'],
-            refresh_token=session_data.credentials['refresh_token'],
-            token_uri=session_data.credentials['token_uri'],
-            client_id=session_data.credentials['client_id'],
-            client_secret=session_data.credentials['client_secret'],
-            scopes=session_data.credentials['scopes']
+            token=stored_credentials['token'],
+            refresh_token=stored_credentials['refresh_token'],
+            token_uri=stored_credentials['token_uri'],
+            client_id=stored_credentials['client_id'],
+            client_secret=stored_credentials['client_secret'],
+            scopes=stored_credentials['scopes']
         )
         
         calendar_service = build('calendar', 'v3', credentials=credentials)
