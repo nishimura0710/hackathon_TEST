@@ -24,6 +24,7 @@ calendar_credentials: Dict[str, GoogleCredentials] = {}
 
 # CORS設定
 FRONTEND_URLS = [
+    "https://google-calendar-bot-lb7lm5oq.devinapps.com",
     "https://hi-chat-app-tunnel-o41v70ny.devinapps.com",
     "https://hi-chat-app-221t4l92.devinapps.com",
     "http://localhost:3000"
@@ -32,7 +33,7 @@ FRONTEND_URLS = [
 app.add_middleware(
     CORSMiddleware,
     allow_origins=FRONTEND_URLS,
-    allow_credentials=False,
+    allow_credentials=True,
     allow_methods=["GET", "POST", "OPTIONS", "HEAD"],
     allow_headers=["Accept", "Content-Type", "Origin", "Authorization", "X-Requested-With"],
     expose_headers=["Content-Type", "Authorization", "Cross-Origin-Opener-Policy"],
@@ -272,7 +273,7 @@ async def chat(bot_id: str, request: ChatRequest):
 
 @app.get("/auth/google")
 async def google_auth(request: Request):
-    backend_url = "https://backend-app-mkawqchd-1738594929.fly.dev"
+    backend_url = "https://backend-app-ikkjfeex.fly.dev"
     redirect_uri = f"{backend_url}/auth/google/callback"
     
     print(f"Starting OAuth flow with redirect_uri: {redirect_uri}")
@@ -305,7 +306,7 @@ async def google_auth_callback(request: Request, code: Optional[str] = None):
             if not code:
                 raise HTTPException(status_code=400, detail="Authorization code not found")
         
-        backend_url = "https://backend-app-mkawqchd-1738594929.fly.dev"
+        backend_url = "https://backend-app-ikkjfeex.fly.dev"
         redirect_uri = f"{backend_url}/auth/google/callback"
         
         flow = Flow.from_client_secrets_file(
