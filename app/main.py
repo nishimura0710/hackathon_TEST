@@ -32,7 +32,6 @@ app = FastAPI()
 
 # CORS設定
 FRONTEND_URLS = [
-    "https://google-calendar-bot-38fb56i8.devinapps.com",
     "https://google-calendar-bot-lb7lm5oq.devinapps.com",
     "http://localhost:3000"
 ]
@@ -107,8 +106,6 @@ async def google_auth():
         return {"auth_url": authorization_url}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    
-    return {"auth_url": authorization_url}
 
 async def get_session_data(
     session_id: UUID = Depends(cookie)
@@ -153,7 +150,6 @@ async def auth_callback(request: Request, code: str):
         
         await backend.create(session_id, session_data)
         
-        # Return HTML that closes the popup and notifies the parent window
         return Response(
             content='''
                 <script>
