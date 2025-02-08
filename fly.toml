@@ -1,10 +1,10 @@
-# fly.toml app configuration file generated for backend-app-mkawqchd-damp-butterfly-9495 on 2025-02-04T05:43:50Z
+# fly.toml app configuration file generated for hackathon-test on 2025-02-08T11:39:10Z
 #
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
 
-app = 'backend-app-mkawqchd-1738594929'
-primary_region = 'sea'
+app = 'hackathon-test'
+primary_region = 'syd'
 
 [build]
 
@@ -20,3 +20,4 @@ primary_region = 'sea'
   memory = '1gb'
   cpu_kind = 'shared'
   cpus = 1
+  memory_mb = 1024
