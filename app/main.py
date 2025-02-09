@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from datetime import datetime, timedelta
@@ -7,10 +7,12 @@ from googleapiclient.discovery import build
 import re
 import os
 from dotenv import load_dotenv
+from claude_service import ClaudeService
 
 load_dotenv()
 
 app = FastAPI()
+claude_service = ClaudeService()
 
 # CORS設定
 app.add_middleware(
@@ -216,107 +218,67 @@ async def handle_chat(message: ChatMessage):
         calendar_service = get_calendar_service()
         
         # FreeBusy APIを使用して空き時間を取得
+        calendar_id = os.getenv('CALENDAR_ID', 'us.tomoki17@gmail.com')
         body = {
             'timeMin': start_time.isoformat() + JST,
             'timeMax': end_time.isoformat() + JST,
             'timeZone': TIMEZONE,
-            'items': [{'id': os.getenv('CALENDAR_ID', 'us.tomoki17@gmail.com')}]
+            'items': [{'id': calendar_id}]
         }
         
         freebusy_response = calendar_service.freebusy().query(body=body).execute()
-        calendar_id = os.getenv('CALENDAR_ID', 'us.tomoki17@gmail.com')
         busy_slots = freebusy_response['calendars'][calendar_id]['busy']
         
-        # 空き時間を探す（1時間の会議を想定）
-        meeting_duration = timedelta(hours=1)
-        free_slots = []
-        current_time = start_time
+        # Claude APIで最適な時間枠を取得
+        slot_suggestion = await claude_service.analyze_free_slots(
+            busy_slots,
+            start_time,
+            end_time,
+            calendar_id
+        )
         
-        # すべてのbusy slotsをタイムゾーンなしに変換
-        normalized_busy_slots = []
-        for slot in busy_slots:
-            slot_start = datetime.fromisoformat(slot['start'].replace('Z', '+00:00')).replace(tzinfo=None)
-            slot_end = datetime.fromisoformat(slot['end'].replace('Z', '+00:00')).replace(tzinfo=None)
-            normalized_busy_slots.append((slot_start, slot_end))
-        
-        # 時間範囲内の各時間枠をチェック
-        while current_time + meeting_duration <= end_time:
-            proposed_end = current_time + meeting_duration
-            is_free = True
-            
-            # この時間枠が既存の予定と重複していないか確認
-            for busy_start, busy_end in normalized_busy_slots:
-                # 重複チェック: 現在の時間枠が既存の予定と重なっているか
-                if (current_time < busy_end and proposed_end > busy_start):
-                    is_free = False
-                    # 重複している場合、busy_endまでスキップして次の時間枠へ
-                    current_time = busy_end
-                    break
-            
-            # 重複があった場合は次のループへ
-            if not is_free:
-                continue
-                
-            # 空き時間が見つかったので予定を登録を試みる
-            event = {
-                'summary': '会議',
-                'start': {
-                    'dateTime': current_time.isoformat() + JST,
-                    'timeZone': TIMEZONE
-                },
-                'end': {
-                    'dateTime': proposed_end.isoformat() + JST,
-                    'timeZone': TIMEZONE
-                }
+        if not slot_suggestion:
+            return {
+                "response": "申し訳ありません。指定された時間範囲内に適切な空き時間が見つかりませんでした。\n"
+                           "別の時間帯をお試しください。"
             }
             
-            # 予定作成前に再度空き時間チェック
-            recheck_body = {
-                'timeMin': current_time.isoformat() + JST,
-                'timeMax': proposed_end.isoformat() + JST,
-                'timeZone': TIMEZONE,
-                'items': [{'id': os.getenv('CALENDAR_ID', 'us.tomoki17@gmail.com')}]
+        # 予定を作成
+        event = {
+            'summary': '会議',
+            'start': {
+                'dateTime': slot_suggestion['suggested_time']['start'],
+                'timeZone': TIMEZONE
+            },
+            'end': {
+                'dateTime': slot_suggestion['suggested_time']['end'],
+                'timeZone': TIMEZONE
             }
+        }
+        
+        try:
+            # アトミックな操作として予定を作成
+            created_event = calendar_service.events().insert(
+                calendarId=calendar_id,
+                body=event
+            ).execute()
             
-            recheck_response = calendar_service.freebusy().query(body=recheck_body).execute()
-            recheck_busy = recheck_response['calendars']['us.tomoki17@gmail.com']['busy']
-            
-            if not recheck_busy:
-                try:
-                    # アトミックな操作として予定を作成
-                    created_event = calendar_service.events().insert(
-                        calendarId='us.tomoki17@gmail.com',
-                        body=event
-                    ).execute()
-                    
-                    # 作成成功時のみ終了
-                    return {
-                        "response": f"以下の空き時間に会議を登録しました：\n"
-                                   f"日時：{current_time.strftime('%Y年%m月%d日 %H:%M')}から"
-                                   f"{proposed_end.strftime('%H:%M')}まで\n"
-                                   f"予定のリンク：{created_event.get('htmlLink')}"
-                    }
-                except Exception as e:
-                    error_type = str(e)
-                    print(f"Event creation failed: {error_type}")
-                    
-                    if "The requested time slot is not available" in error_type:
-                        # 時間枠が既に使用されている場合
-                        current_time += meeting_duration
-                        continue
-                    elif "Invalid time range" in error_type:
-                        return {
-                            "response": "申し訳ありません。指定された時間範囲が無効です。\n"
-                                       "時間の指定を確認して、もう一度お試しください。"
-                        }
-                    else:
-                        # その他のエラー
-                        current_time += meeting_duration
-                        continue
-            
-            # 空き時間が見つからなかった場合は次の時間枠へ
-            if not is_free:
-                current_time += meeting_duration
+            return {
+                "response": f"以下の時間に会議を登録しました：\n"
+                           f"{slot_suggestion['reason']}\n"
+                           f"予定のリンク：{created_event.get('htmlLink')}"
+            }
+        except Exception as e:
+            print(f"Event creation error: {str(e)}")
+            return {
+                "response": "申し訳ありません。予定の登録に失敗しました。\n"
+                           "以下のいずれかの理由により登録できませんでした：\n"
+                           "・指定された時間帯が既に予約されています\n"
+                           "・カレンダーへのアクセス権限の問題\n"
+                           "・ネットワークエラー\n"
+                           "・システムエラー\n\n"
+                           "別の時間帯を指定するか、しばらく待ってから、もう一度お試しください。"
+            }
         
         # すべての時間枠をチェックしても空き時間が見つからなかった場合
         return {
