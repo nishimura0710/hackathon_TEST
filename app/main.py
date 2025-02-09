@@ -1,364 +1,188 @@
-from fastapi import FastAPI, HTTPException, Depends, Response, Request
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from typing import List, Optional, AsyncGenerator
-import anthropic
-import os
-from dotenv import load_dotenv
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import Flow
-from googleapiclient.discovery import build
 from datetime import datetime, timedelta
-import json
-import asyncio
-from typing import Optional, Dict, Any
-from google.oauth2.credentials import Credentials as GoogleCredentials
-
-load_dotenv()
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+import re
 
 app = FastAPI()
 
-# Global variable to store credentials (POC only - would use secure storage in production)
-calendar_credentials: Dict[str, GoogleCredentials] = {}
-
 # CORS設定
-FRONTEND_URLS = [
-    "https://hi-chat-app-tunnel-o41v70ny.devinapps.com",
-    "https://hi-chat-app-221t4l92.devinapps.com",
-    "http://localhost:3000"
-]
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=FRONTEND_URLS,
-    allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS", "HEAD"],
-    allow_headers=["Accept", "Content-Type", "Origin", "Authorization", "X-Requested-With"],
-    expose_headers=["Content-Type", "Authorization", "Cross-Origin-Opener-Policy"],
-    max_age=3600
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"]
 )
 
-@app.middleware("http")
-async def add_security_headers(request: Request, call_next):
-    response = await call_next(request)
-    response.headers["Cross-Origin-Opener-Policy"] = "same-origin-allow-popups"
-    return response
+# カレンダーAPI設定
+SCOPES = ['https://www.googleapis.com/auth/calendar']
 
-# ボット設定
-BOTS = {
-    "schedule": {
-        "id": "schedule",
-        "name": "日程調整Bot",
-        "description": "日程調整を手伝います",
-        "system_prompt": """あなたは日程調整の専門家です。Googleカレンダーと連携して、複数の参加者の予定を確認し、最適な会議時間を提案することができます。
+class ChatMessage(BaseModel):
+    message: str
 
-以下のような機能があります：
-1. 複数の参加者のGoogleカレンダーから予定を取得して確認
-2. 全員が参加可能な空き時間を自動的に検出
-3. 優先度や時間帯の希望に応じて最適な時間を提案
+def get_calendar_service():
+    credentials = service_account.Credentials.from_service_account_file(
+        'app/service_account.json',
+        scopes=SCOPES
+    )
+    return build('calendar', 'v3', credentials=credentials)
 
-例えば：
-- 「AさんとBさんと来週打ち合わせをしたいです」
-- 「3人で今週中に1時間の会議を設定したい」
-- 「午前中で都合の良い時間を探して」
-
-このような要望に対して、カレンダー情報を確認して具体的な日時を提案します。
-提供されたカレンダー情報に基づいて、全員が参加可能な時間帯を見つけ出し、最適な日時を提案します。""",
-    }
-}
-
-# Google Calendar API設定
-SCOPES = ['https://www.googleapis.com/auth/calendar.readonly']
-credentials = None
-
-class Message(BaseModel):
-    role: str
-    content: str
-
-class ChatRequest(BaseModel):
-    messages: List[Message]
-
-@app.get("/bots")
-async def get_bots():
-    return list(BOTS.values())
-
-@app.get("/bots/{bot_id}")
-async def get_bot(bot_id: str):
-    if bot_id not in BOTS:
-        raise HTTPException(status_code=404, detail="Bot not found")
-    return BOTS[bot_id]
-
-def find_common_free_slots(events_by_user: dict, start_time: datetime, end_time: datetime) -> list:
-    all_busy_slots = []
-    
-    # Convert all events to busy slots
-    for user_events in events_by_user.values():
-        if isinstance(user_events, dict) and "error" in user_events:
-            continue
-            
-        for event in user_events:
-            start = datetime.fromisoformat(event['start'].replace('Z', '+00:00'))
-            end = datetime.fromisoformat(event['end'].replace('Z', '+00:00'))
-            all_busy_slots.append((start, end))
-    
-    # Sort busy slots by start time
-    all_busy_slots.sort(key=lambda x: x[0])
-    
-    # Merge overlapping slots
-    if not all_busy_slots:
-        return [{"start": start_time.isoformat(), "end": end_time.isoformat()}]
-        
-    merged_busy = []
-    current_start, current_end = all_busy_slots[0]
-    
-    for slot_start, slot_end in all_busy_slots[1:]:
-        if slot_start <= current_end:
-            current_end = max(current_end, slot_end)
-        else:
-            merged_busy.append((current_start, current_end))
-            current_start, current_end = slot_start, slot_end
-    merged_busy.append((current_start, current_end))
-    
-    # Find free slots between busy periods
-    free_slots = []
-    current_time = start_time
-    
-    for busy_start, busy_end in merged_busy:
-        if current_time < busy_start:
-            free_slots.append({
-                "start": current_time.isoformat(),
-                "end": busy_start.isoformat()
-            })
-        current_time = busy_end
-    
-    if current_time < end_time:
-        free_slots.append({
-            "start": current_time.isoformat(),
-            "end": end_time.isoformat()
-        })
-    
-    return free_slots
-
-@app.get("/calendar/events")
-async def get_events(user_ids: str, find_free_slots: bool = False):
-    user_id_list = user_ids.split(',')
-    now = datetime.now()
-    week_later = now + timedelta(days=7)
-    
-    all_events = {}
-    for user_id in user_id_list:
-        try:
-            events = await get_calendar_events(user_id.strip(), now, week_later)
-            all_events[user_id] = events
-        except Exception as e:
-            all_events[user_id] = {"error": str(e)}
-    
-    if find_free_slots:
-        free_slots = find_common_free_slots(all_events, now, week_later)
-        return {"events": all_events, "free_slots": free_slots}
-    
-    return {"events": all_events}
-
-@app.post("/chat/{bot_id}")
-async def chat(bot_id: str, request: ChatRequest):
-    if bot_id not in BOTS:
-        raise HTTPException(status_code=404, detail="Bot not found")
-    
+@app.post("/calendar/chat")
+async def handle_chat(message: ChatMessage):
     try:
-        api_key = os.getenv("ANTHROPIC_API_KEY")
-        if not api_key:
-            raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not set")
+        msg = message.message
         
-        print(f"Processing chat request for bot: {bot_id}")
-        print(f"Received messages: {request.messages}")
+        # 日付と時間範囲の抽出（例：2月12日の12時から16時）
+        date_match = re.search(r'(\d+)月(\d+)日', msg)
+        time_range_match = re.search(r'(\d+)時から(\d+)時', msg)
         
-        # カレンダー情報を取得
-        user_id = "default_user"
-        if bot_id == "schedule" and user_id in calendar_credentials:
-            now = datetime.now()
-            week_later = now + timedelta(days=7)
-            try:
-                events = await get_calendar_events(user_id, now, week_later)
-                
-                # 空き時間を計算
-                free_slots = find_common_free_slots({"default_user": events}, now, week_later)
-                
-                calendar_info = "\n\n現在の予定:\n"
-                for event in events:
-                    start = event['start'].get('dateTime', event['start'].get('date'))
-                    end = event['end'].get('dateTime', event['end'].get('date'))
-                    calendar_info += f"- {event['summary']}: {start} から {end}\n"
-                
-                calendar_info += "\n\n空き時間:\n"
-                for slot in free_slots:
-                    start = datetime.fromisoformat(slot['start'].replace('Z', '+00:00'))
-                    end = datetime.fromisoformat(slot['end'].replace('Z', '+00:00'))
-                    calendar_info += f"- {start.strftime('%Y-%m-%d %H:%M')} から {end.strftime('%Y-%m-%d %H:%M')}\n"
-                
-            except Exception as e:
-                calendar_info = "\n\nカレンダー情報の取得に失敗しました。"
-        else:
-            calendar_info = "\n\nカレンダーの認証が必要です。/auth/google エンドポイントで認証を行ってください。"
-            
-        client = anthropic.AsyncAnthropic(api_key=api_key)
-        
-        # システムプロンプトとユーザーメッセージを結合
-        system_prompt = BOTS[bot_id]["system_prompt"]
-        user_message = request.messages[-1].content + calendar_info
-        
-        print(f"System prompt: {system_prompt}")
-        print(f"User message: {user_message}")
-        
-        # Claude APIを使用してレスポンスを生成
-        message = await client.messages.create(
-            model="claude-3-opus-20240229",
-            max_tokens=1000,
-            messages=[
-                {
-                    "role": "user",
-                    "content": user_message
-                }
-            ],
-            system=system_prompt
-        )
-        
-        async def generate() -> AsyncGenerator[str, None]:
-            content = message.content
-            print(f"Full response content: {content}")
-            
-            # Send role first
-            yield "data: " + json.dumps({
-                "id": message.id,
-                "object": "chat.completion.chunk",
-                "created": int(datetime.now().timestamp()),
-                "model": "claude-3-opus-20240229",
-                "choices": [{
-                    "index": 0,
-                    "delta": {
-                        "role": "assistant"
-                    }
-                }]
-            }) + "\n\n"
-            
-            # Send content
-            yield "data: " + json.dumps({
-                "id": message.id,
-                "object": "chat.completion.chunk",
-                "created": int(datetime.now().timestamp()),
-                "model": "claude-3-opus-20240229",
-                "choices": [{
-                    "index": 0,
-                    "delta": {
-                        "content": content
-                    }
-                }]
-            }) + "\n\n"
-            
-            # Send completion
-            yield "data: [DONE]\n\n"
-
-        return StreamingResponse(
-            generate(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
+        if not date_match or not time_range_match:
+            return {
+                "response": "すみません、日時を理解できませんでした。\n"
+                           "例：「2月12日の12時から16時で空いてる時間に会議を入れて」のように教えてください。\n"
+                           "※ 日付と時間は数字で指定してください。"
             }
-        )
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/auth/google")
-async def google_auth(request: Request):
-    backend_url = "https://backend-app-mkawqchd-1738594929.fly.dev"
-    redirect_uri = f"{backend_url}/auth/google/callback"
-    
-    print(f"Starting OAuth flow with redirect_uri: {redirect_uri}")
-    
-    try:
-        flow = Flow.from_client_secrets_file(
-            "app/client_secrets.json",
-            scopes=SCOPES
-        )
-        flow.redirect_uri = redirect_uri
-        auth_url, state = flow.authorization_url(
-            access_type='offline',
-            include_granted_scopes='true',
-            prompt='consent'
-        )
-        print(f"Generated auth_url: {auth_url}")
-        return {"auth_url": auth_url}
-    except Exception as e:
-        print(f"Error in OAuth flow: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/auth/google/callback")
-@app.post("/auth/google/callback")
-async def google_auth_callback(request: Request, code: Optional[str] = None):
-    try:
-        # Handle GET request from Google OAuth redirect
-        if not code:
-            params = dict(request.query_params)
-            code = params.get('code')
-            if not code:
-                raise HTTPException(status_code=400, detail="Authorization code not found")
-        
-        backend_url = "https://backend-app-mkawqchd-1738594929.fly.dev"
-        redirect_uri = f"{backend_url}/auth/google/callback"
-        
-        flow = Flow.from_client_secrets_file(
-            "app/client_secrets.json",
-            scopes=SCOPES
-        )
-        flow.redirect_uri = redirect_uri
-        flow.fetch_token(code=code)
-        credentials = flow.credentials
-        
-        # Store credentials in memory (POC only)
-        user_id = "default_user"  # In production, this would be a real user ID
-        calendar_credentials[user_id] = credentials
-        
-        # Redirect back to the frontend after successful authentication
-        return Response(
-            content='<script>window.close();</script>',
-            media_type='text/html'
-        )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-async def get_calendar_events(user_id: str, time_min: datetime, time_max: datetime):
-    if user_id not in calendar_credentials:
-        raise HTTPException(status_code=401, detail="カレンダーの認証が必要です")
-    
-    try:
-        service = build('calendar', 'v3', credentials=calendar_credentials[user_id])
-        events_result = service.events().list(
-            calendarId='primary',
-            timeMin=time_min.isoformat() + 'Z',
-            timeMax=time_max.isoformat() + 'Z',
-            singleEvents=True,
-            orderBy='startTime'
-        ).execute()
-        
-        events = events_result.get('items', [])
-        formatted_events = []
-        
-        for event in events:
-            start = event['start'].get('dateTime', event['start'].get('date'))
-            end = event['end'].get('dateTime', event['end'].get('date'))
-            formatted_events.append({
-                'summary': event.get('summary', '予定あり'),
-                'start': start,
-                'end': end,
-                'id': event['id']
-            })
             
-        return formatted_events
+        # 日付の設定
+        month = int(date_match.group(1))
+        day = int(date_match.group(2))
+        current_year = datetime.now().year
+        
+        # 時間の設定と検証
+        start_hour = int(time_range_match.group(1))
+        end_hour = int(time_range_match.group(2))
+        
+        # 基本的な入力値の検証
+        if not (1 <= month <= 12 and 1 <= day <= 31):
+            return {
+                "response": "申し訳ありません。正しい日付を指定してください。\n"
+                           "月は1-12、日は1-31の範囲で指定してください。"
+            }
+            
+        if not (0 <= start_hour <= 23 and 0 <= end_hour <= 23):
+            return {
+                "response": "申し訳ありません。正しい時間を指定してください。\n"
+                           "時間は0-23の範囲で指定してください。"
+            }
+            
+        if start_hour >= end_hour:
+            return {
+                "response": "申し訳ありません。終了時間は開始時間より後の時間を指定してください。"
+            }
+            
+        # 日付の妥当性チェック
+        try:
+            target_date = datetime(current_year, month, day)
+            if target_date.date() < datetime.now().date():
+                return {
+                    "response": "申し訳ありません。過去の日付は指定できません。\n"
+                               "今日以降の日付を指定してください。"
+                }
+        except ValueError:
+            return {
+                "response": "申し訳ありません。指定された日付は存在しません。\n"
+                           "正しい日付を指定してください。"
+            }
+        
+        # 時間範囲の設定
+        start_hour = int(time_range_match.group(1))
+        end_hour = int(time_range_match.group(2))
+        
+        # 開始時刻と終了時刻の設定（JSTで設定）
+        start_time = datetime(current_year, month, day, start_hour, 0, 0)
+        end_time = datetime(current_year, month, day, end_hour, 0, 0)
+        current_time = start_time
+        meeting_duration = timedelta(hours=1)
+        
+        # カレンダーサービスの取得
+        calendar_service = get_calendar_service()
+        
+        # FreeBusy APIを使用して空き時間を取得
+        body = {
+            'timeMin': start_time.isoformat() + '+09:00',
+            'timeMax': end_time.isoformat() + '+09:00',
+            'timeZone': 'Asia/Tokyo',
+            'items': [{'id': 'us.tomoki17@gmail.com'}]
+        }
+        
+        freebusy_response = calendar_service.freebusy().query(body=body).execute()
+        busy_slots = freebusy_response['calendars']['us.tomoki17@gmail.com']['busy']
+        
+        # 空き時間を探す（1時間の会議を想定）
+        meeting_duration = timedelta(hours=1)
+        free_slots = []
+        current_time = start_time
+        
+        # 最初の空き時間を確認
+        if not busy_slots:
+            free_slots.append((current_time, end_time))
+        else:
+            # 最初のbusy slotまでの空き時間を確認
+            first_busy_start = datetime.fromisoformat(busy_slots[0]['start'].replace('Z', '+00:00'))
+            if current_time + meeting_duration <= first_busy_start:
+                free_slots.append((current_time, first_busy_start))
+            
+            # busy slotsの間の空き時間を確認
+            for i in range(len(busy_slots)):
+                current_busy_end = datetime.fromisoformat(busy_slots[i]['end'].replace('Z', '+00:00'))
+                next_busy_start = datetime.fromisoformat(busy_slots[i + 1]['start'].replace('Z', '+00:00')) if i + 1 < len(busy_slots) else end_time
+                
+                if current_busy_end + meeting_duration <= next_busy_start:
+                    free_slots.append((current_busy_end, next_busy_start))
+            
+            # 空き時間が見つかった場合、最初の空き時間に予定を登録
+            if free_slots:
+                slot_start, slot_end = free_slots[0]
+                event = {
+                    'summary': '会議',
+                    'start': {
+                        'dateTime': slot_start.isoformat() + '+09:00',
+                        'timeZone': 'Asia/Tokyo'
+                    },
+                    'end': {
+                        'dateTime': (slot_start + meeting_duration).isoformat() + '+09:00',
+                        'timeZone': 'Asia/Tokyo'
+                    }
+                }
+                
+                created_event = calendar_service.events().insert(
+                    calendarId='us.tomoki17@gmail.com',
+                    body=event
+                ).execute()
+                
+                return {
+                    "response": f"以下の空き時間に会議を登録しました：\n"
+                               f"日時：{slot_start.strftime('%Y年%m月%d日 %H:%M')}から"
+                               f"{(slot_start + meeting_duration).strftime('%H:%M')}まで\n"
+                               f"予定のリンク：{created_event.get('htmlLink')}"
+                }
+        
+        return {
+            "response": "申し訳ありません。指定された時間範囲内（" + 
+                       f"{start_time.strftime('%H:%M')}から{end_time.strftime('%H:%M')}まで）に\n" +
+                       "1時間の空き時間が見つかりませんでした。\n" +
+                       "別の時間帯をお試しください。"
+        }
+        
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"カレンダー情報の取得に失敗しました: {str(e)}")
+        print(f"Error: {str(e)}")
+        return {
+            "response": "申し訳ありません。予定の登録に失敗しました。\n"
+                       "以下のいずれかの理由が考えられます：\n"
+                       "・カレンダーへのアクセス権限の問題\n"
+                       "・ネットワークエラー\n"
+                       "・システムエラー\n\n"
+                       "しばらく待ってから、もう一度お試しください。"
+        }
+
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy"}
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8080)
