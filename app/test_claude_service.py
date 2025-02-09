@@ -6,7 +6,10 @@ from unittest.mock import AsyncMock, patch
 
 @pytest.mark.asyncio
 async def test_analyze_free_slots():
-    with patch('anthropic.Anthropic') as mock_anthropic:
+    with patch('os.getenv') as mock_getenv, \
+         patch('anthropic.Anthropic') as mock_anthropic:
+        # Mock environment variable
+        mock_getenv.return_value = "test-api-key"
         mock_client = AsyncMock()
         mock_anthropic.return_value = mock_client
         

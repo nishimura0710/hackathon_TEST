@@ -280,17 +280,12 @@ async def handle_chat(message: ChatMessage):
                            "別の時間帯を指定するか、しばらく待ってから、もう一度お試しください。"
             }
         
-        # すべての時間枠をチェックしても空き時間が見つからなかった場合
-        return {
-            "response": "申し訳ありません。指定された時間範囲内（" + 
-                       f"{start_time.strftime('%H:%M')}から{end_time.strftime('%H:%M')}まで）に\n" +
-                       "1時間の空き時間が見つかりませんでした。\n" +
-                       "別の時間帯をお試しください。"
-        }
-        
     except Exception as e:
         print(f"Error: {str(e)}")
-        error_time = f"{start_time.strftime('%Y年%m月%d日 %H:%M')}から{end_time.strftime('%H:%M')}まで"
+        try:
+            error_time = f"{start_time.strftime('%Y年%m月%d日 %H:%M')}から{end_time.strftime('%H:%M')}まで"
+        except NameError:
+            error_time = "指定された時間帯"
         return {
             "response": "申し訳ありません。予定の登録に失敗しました。\n"
                        f"指定された時間帯（{error_time}）で以下のいずれかの理由により登録できませんでした：\n"

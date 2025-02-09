@@ -33,11 +33,18 @@ class ClaudeService:
         この中で空いている時間帯を見つけ、最適な1時間のスロットを提案してください。
 
         条件:
-        - 営業時間：9:00から18:00まで
+        - 営業時間：午前9時から午後6時まで
         - できるだけ早い時間のスロットを優先
-        - 1時間の時間を確保
-        - 既存の予定と重複しない
-        - 予定と予定の間に十分な空きがある時間帯を選択
+        - 1時間の会議時間を確保
+        - 既存の予定と重複しないこと
+        - 予定と予定の間に15分以上の余裕を確保
+        - 時間の説明は日本語で詳しく（例：午前10時から午前11時まで）
+
+        選択理由も日本語で詳しく説明してください。
+        例：「この時間帯を選んだ理由：
+        ・営業時間内の早い時間帯
+        ・前後の予定と15分以上の間隔あり
+        ・1時間の会議時間を確保可能」
 
         JSON:
         {json.dumps(calendar_data, ensure_ascii=False, indent=2)}
@@ -88,34 +95,49 @@ class ClaudeService:
         try:
             # Validate suggested time slot
             suggested = result.get("suggested_time", {})
-            slot_start = datetime.fromisoformat(suggested.get("start")).replace(tzinfo=None)
-            slot_end = datetime.fromisoformat(suggested.get("end")).replace(tzinfo=None)
-            
-            # Check business hours
-            if not (9 <= slot_start.hour < 18 and 9 <= slot_end.hour <= 18):
+            if not suggested:
+                print("スロット提案が見つかりません")
                 return False
                 
-            # Check slot duration
+            try:
+                slot_start = datetime.fromisoformat(suggested.get("start")).replace(tzinfo=None)
+                slot_end = datetime.fromisoformat(suggested.get("end")).replace(tzinfo=None)
+            except (ValueError, TypeError) as e:
+                print(f"日時のパース中にエラーが発生しました: {str(e)}")
+                return False
+            
+            # Check business hours (9:00-18:00)
+            if not (9 <= slot_start.hour < 18 and 9 <= slot_end.hour <= 18):
+                print("営業時間外の時間帯が提案されました")
+                return False
+                
+            # Strictly validate slot duration (exactly 1 hour)
             if slot_end - slot_start != timedelta(hours=1):
+                print("提案された時間枠が1時間ではありません")
                 return False
                 
             # Check within requested time range
             if slot_start < start_time or slot_end > end_time:
+                print("提案された時間枠が指定された範囲外です")
                 return False
                 
-            # Check for overlaps with existing events
+            # Check for overlaps and minimum buffer with ALL existing events
+            buffer = timedelta(minutes=15)
             for busy in busy_slots:
                 busy_start = datetime.fromisoformat(busy["start"]).replace(tzinfo=None)
                 busy_end = datetime.fromisoformat(busy["end"]).replace(tzinfo=None)
+                
+                # Strict overlap check
                 if (slot_start < busy_end and slot_end > busy_start):
+                    print("既存の予定と重複しています")
                     return False
                 
-                # Check for minimum buffer between events (15 minutes)
-                buffer = timedelta(minutes=15)
+                # Ensure minimum 15-minute buffer before and after
                 if abs(slot_start - busy_end) < buffer or abs(slot_end - busy_start) < buffer:
+                    print("既存の予定との間隔が15分未満です")
                     return False
                     
             return True
         except Exception as e:
-            print(f"Claude API error: {str(e)}")
+            print(f"スロット検証エラー: {str(e)}")  # Changed to Japanese for consistency
             return False
