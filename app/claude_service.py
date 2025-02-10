@@ -1,121 +1,126 @@
-from datetime import datetime, timedelta
-from anthropic import Anthropic
-import os
-from typing import Dict, List, Optional
+from datetime import datetime, timedelta, timezone
 import json
 
 class ClaudeService:
     def __init__(self):
-        api_key = os.getenv("ANTHROPIC_API_KEY")
-        if not api_key:
-            raise ValueError("ANTHROPIC_API_KEY environment variable is not set")
-        self.client = Anthropic(api_key=api_key)
+        pass
     
-    def analyze_free_slots(
-        self,
-        busy_slots: List[Dict],
-        start_time: datetime,
-        end_time: datetime,
-        calendar_id: str
-    ) -> Optional[Dict]:
-        """Find the best available time slot for a meeting."""
-        calendar_data = {
-            "calendars": {
-                calendar_id: {
-                    "busy": busy_slots
-                }
-            }
-        }
-        
-        prompt = f"""
-次のデータは Google Calendar の busy 時間です。空いている時間のリストを作成し、1時間の最適な時間を提案してください。
-
-指定された範囲: {start_time.strftime("%Y-%m-%d %H:%M")} 〜 {end_time.strftime("%Y-%m-%d %H:%M")}
-Busyデータ: {json.dumps(calendar_data, ensure_ascii=False)}
-
-条件:
-- 最も早い時間に予約
-- 1時間の会議時間を確保
-- タイムゾーン：日本時間（JST/UTC+9）
-- 営業時間：午前9時から午後6時まで
-- 既存の予定と重複しない
-- 予定の前後に15分以上の余裕を確保
-- 時間の説明は日本語で詳しく
-
-出力形式:
-{{
-  "suggested_time": {{
-    "start": "YYYY-MM-DDTHH:MM:SS+09:00",
-    "end": "YYYY-MM-DDTHH:MM:SS+09:00"
-  }},
-  "reason": "選択理由（日本語で説明）"
-}}
-"""
-        
+    def validate_time_slot(self, slot_start, slot_end, busy_slots):
+        """Validate that a suggested time slot doesn't overlap with busy slots."""
         try:
-            response = self.client.messages.create(
-                model="claude-3-opus-20240229",
-                max_tokens=1000,
-                messages=[{"role": "user", "content": prompt}]
-            )
+            # Convert all times to UTC for comparison
+            utc = timezone.utc
+            slot_start = slot_start.astimezone(utc)
+            slot_end = slot_end.astimezone(utc)
             
-            text = response.content[0].text
-            json_start = text.find('{')
-            json_end = text.rfind('}') + 1
+            # Convert to JST for business hours check
+            jst = timezone(timedelta(hours=9))
+            jst_start = slot_start.astimezone(jst)
+            jst_end = slot_end.astimezone(jst)
             
-            if json_start >= 0 and json_end > json_start:
-                slot_data = json.loads(text[json_start:json_end])
-                if self._validate_slot(slot_data, start_time, end_time, busy_slots):
-                    return slot_data
-            
-            return None
-            
-        except Exception as e:
-            print(f"Claude APIエラー: {str(e)}")
-            return None
-            
-    def _validate_slot(
-        self,
-        result: Dict,
-        start_time: datetime,
-        end_time: datetime,
-        busy_slots: List[Dict]
-    ) -> bool:
-        """Validate the suggested time slot."""
-        try:
-            suggested = result.get("suggested_time", {})
-            if not suggested:
+            # Check business hours (9:00-18:00 JST)
+            if not (9 <= jst_start.hour < 18 and 9 <= jst_end.hour <= 18):
                 return False
-            
-            # Parse times and normalize to naive datetime
-            slot_start = datetime.fromisoformat(suggested["start"]).replace(tzinfo=None)
-            slot_end = datetime.fromisoformat(suggested["end"]).replace(tzinfo=None)
-            start_time = start_time.replace(tzinfo=None)
-            end_time = end_time.replace(tzinfo=None)
-            
-            # Basic validation checks
-            if not (9 <= slot_start.hour < 18 and 9 <= slot_end.hour <= 18):
-                return False
-            
-            if slot_end - slot_start != timedelta(hours=1):
-                return False
-            
-            if slot_start < start_time or slot_end > end_time:
-                return False
-            
-            # Check for conflicts with existing events
-            buffer = timedelta(minutes=15)
-            for busy in busy_slots:
-                busy_start = datetime.fromisoformat(busy["start"].replace('Z', '+00:00')).replace(tzinfo=None)
-                busy_end = datetime.fromisoformat(busy["end"].replace('Z', '+00:00')).replace(tzinfo=None)
                 
+            # Check for conflicts with existing events
+            for busy in busy_slots:
+                busy_start = datetime.fromisoformat(busy["start"].replace('Z', '+00:00')).astimezone(utc)
+                busy_end = datetime.fromisoformat(busy["end"].replace('Z', '+00:00')).astimezone(utc)
+                
+                # Check overlap
                 if (slot_start < busy_end and slot_end > busy_start):
                     return False
-                
-                if abs(slot_start - busy_end) < buffer or abs(slot_end - busy_start) < buffer:
-                    return False
-            
+                    
             return True
-            
-        except Exception:
+        except Exception as e:
+            print(f"Validation error: {str(e)}")
             return False
+    
+    def find_available_slots(self, busy_slots, start_time, end_time):
+        """Find available time slots within the given range."""
+        available_slots = []
+        
+        # Convert busy slots to datetime objects and sort them
+        busy_periods = []
+        for slot in busy_slots:
+            slot_start = datetime.fromisoformat(slot["start"].replace('Z', '+00:00'))
+            slot_end = datetime.fromisoformat(slot["end"].replace('Z', '+00:00'))
+            busy_periods.append((slot_start, slot_end))
+        
+        busy_periods.sort(key=lambda x: x[0])
+        
+        # If no busy periods, return first available hour
+        if not busy_periods:
+            available_slots.append({
+                "start": start_time,
+                "end": start_time + timedelta(hours=1)
+            })
+            return available_slots
+            
+        # Start from the end of first busy period
+        current = busy_periods[0][1]
+        
+        # Find gaps between busy periods
+        for i in range(len(busy_periods)):
+            # If this is not the last busy period, check gap until next busy period
+            if i < len(busy_periods) - 1:
+                next_start = busy_periods[i + 1][0]
+                if current + timedelta(hours=1) <= next_start:
+                    available_slots.append({
+                        "start": current,
+                        "end": current + timedelta(hours=1)
+                    })
+            current = busy_periods[i][1]
+        
+        # Check final period after last busy slot
+        if current + timedelta(hours=1) <= end_time:
+            available_slots.append({
+                "start": current,
+                "end": current + timedelta(hours=1)
+            })
+            
+        return available_slots
+
+    def analyze_free_slots(self, busy_slots, start_time, end_time, calendar_id, message=""):
+        """Analyze and find available time slots."""
+        try:
+            # Convert times to JST for consistent handling
+            jst = timezone(timedelta(hours=9))
+            start_time = start_time.astimezone(jst)
+            end_time = end_time.astimezone(jst)
+            
+            # Find available slots
+            available_slots = self.find_available_slots(busy_slots, start_time, end_time)
+            
+            if not available_slots:
+                return {
+                    "suggested_time": {
+                        "start": start_time.isoformat(),
+                        "end": end_time.isoformat()
+                    },
+                    "reason": "指定された時間帯に空き時間が見つかりませんでした。別の時間帯をお試しください。"
+                }
+            
+            # Select the first available slot (earliest time)
+            selected_slot = available_slots[0]
+            slot_start = selected_slot["start"].astimezone(jst)
+            slot_end = selected_slot["end"].astimezone(jst)
+            
+            # Format times for response
+            return {
+                "suggested_time": {
+                    "start": slot_start.isoformat(),
+                    "end": slot_end.isoformat()
+                },
+                "reason": f"{slot_start.strftime('%H:%M')}から{slot_end.strftime('%H:%M')}の時間帯が空いているため、この時間に予定を登録します。"
+            }
+            
+        except Exception as e:
+            print(f"Error analyzing free slots: {str(e)}")
+            return {
+                "suggested_time": {
+                    "start": start_time.isoformat(),
+                    "end": end_time.isoformat()
+                },
+                "reason": "予定の確認中にエラーが発生しました。別の時間帯をお試しください。"
+            }
