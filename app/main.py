@@ -104,41 +104,29 @@ async def handle_chat(message: ChatMessage):
         print(f"Busy slots: {json.dumps(busy_slots, indent=2)}")
         print(f"Calendar ID: {calendar_id}")
         
-        # Convert requested time to UTC for comparison
-        utc_start = start_time.astimezone(timezone.utc)
-        utc_end = end_time.astimezone(timezone.utc)
-        print(f"Requested time (UTC): {utc_start} - {utc_end}")
-        print(f"Requested time (JST): {start_time} - {end_time}")
+        # Use claude_service to find available slots
+        result = claude_service.analyze_free_slots(
+            busy_slots=busy_slots,
+            start_time=start_time,
+            end_time=end_time,
+            calendar_id=calendar_id
+        )
         
-        # Check for conflicts
-        has_conflict = False
-        if busy_slots:  # Only check conflicts if there are busy slots
-            for busy in busy_slots:
-                busy_start = datetime.fromisoformat(busy['start'].replace('Z', '+00:00')).astimezone(timezone.utc)
-                busy_end = datetime.fromisoformat(busy['end'].replace('Z', '+00:00')).astimezone(timezone.utc)
-                print(f"Checking busy slot (UTC): {busy_start} - {busy_end}")
-                print(f"Checking busy slot (JST): {busy_start.astimezone(timezone(timedelta(hours=9)))} - {busy_end.astimezone(timezone(timedelta(hours=9)))}")
-                
-                # Check for direct overlap
-                if (utc_start < busy_end and utc_end > busy_start):
-                    has_conflict = True
-                    print("Conflict detected!")
-                    break
-                else:
-                    print("No conflict with this slot")
-                    
-        if has_conflict:
-            return {"response": "申し訳ありません。指定された時間帯は既に予定が入っています。別の時間帯をお試しください。"}
+        if not result.get('suggested_time'):
+            return {"response": result.get('reason')}
             
-        # Create event if no conflicts
+        # Create event using suggested time
+        suggested_start = datetime.fromisoformat(result['suggested_time']['start'])
+        suggested_end = datetime.fromisoformat(result['suggested_time']['end'])
+        
         event = {
             'summary': '会議',
             'start': {
-                'dateTime': start_time.astimezone(timezone.utc).isoformat().replace('+00:00', 'Z'),
+                'dateTime': suggested_start.astimezone(timezone.utc).isoformat().replace('+00:00', 'Z'),
                 'timeZone': 'Asia/Tokyo'
             },
             'end': {
-                'dateTime': end_time.astimezone(timezone.utc).isoformat().replace('+00:00', 'Z'),
+                'dateTime': suggested_end.astimezone(timezone.utc).isoformat().replace('+00:00', 'Z'),
                 'timeZone': 'Asia/Tokyo'
             },
             'reminders': {
@@ -148,117 +136,13 @@ async def handle_chat(message: ChatMessage):
         
         try:
             created = service.events().insert(calendarId=calendar_id, body=event).execute()
-            jst_time = start_time.strftime("%Y年%m月%d日 %H時%M分")
+            jst_time = suggested_start.strftime("%Y年%m月%d日 %H時%M分")
             return {
-                "response": f"以下の時間に会議を登録しました：\n{jst_time}から1時間\n"
+                "response": f"{result.get('reason')}\n"
                            f"予定のリンク：{created.get('htmlLink')}"
             }
         except Exception:
             return {"response": "申し訳ありません。予定の登録中にエラーが発生しました。別の時間帯をお試しください。"}
-        
-        # Check if requested time slot is busy (handle UTC/JST conversion)
-        utc_start = start_time.astimezone(timezone.utc)
-        utc_end = end_time.astimezone(timezone.utc)
-        print(f"Requested time (UTC): {utc_start} - {utc_end}")
-        print(f"Requested time (JST): {start_time} - {end_time}")
-        
-        # Check for direct conflicts without buffer
-        has_conflict = False
-        if busy_slots:  # Only check conflicts if there are busy slots
-            for busy in busy_slots:
-                busy_start = datetime.fromisoformat(busy['start'].replace('Z', '+00:00')).astimezone(timezone.utc)
-                busy_end = datetime.fromisoformat(busy['end'].replace('Z', '+00:00')).astimezone(timezone.utc)
-                print(f"Checking busy slot (UTC): {busy_start} - {busy_end}")
-                print(f"Checking busy slot (JST): {busy_start.astimezone(timezone(timedelta(hours=9)))} - {busy_end.astimezone(timezone(timedelta(hours=9)))}")
-                
-                # Check for direct overlap
-                if (utc_start < busy_end and utc_end > busy_start):
-                    has_conflict = True
-                    print("Conflict detected!")
-                    break
-                else:
-                    print("No conflict with this slot")
-                
-        if has_conflict:
-            return {"response": "申し訳ありません。指定された時間帯は既に予定が入っています。別の時間帯をお試しください。"}
-            
-        # Create event if no conflicts
-        event = {
-            'summary': '会議',
-            'start': {
-                'dateTime': start_time.astimezone(timezone.utc).isoformat().replace('+00:00', 'Z'),
-                'timeZone': 'Asia/Tokyo'
-            },
-            'end': {
-                'dateTime': end_time.astimezone(timezone.utc).isoformat().replace('+00:00', 'Z'),
-                'timeZone': 'Asia/Tokyo'
-            },
-            'reminders': {
-                'useDefault': True
-            }
-        }
-        
-        # Create event if no conflicts
-        event = {
-            'summary': '会議',
-            'start': {
-                'dateTime': start_time.astimezone(timezone.utc).isoformat().replace('+00:00', 'Z'),
-                'timeZone': 'Asia/Tokyo'
-            },
-            'end': {
-                'dateTime': end_time.astimezone(timezone.utc).isoformat().replace('+00:00', 'Z'),
-                'timeZone': 'Asia/Tokyo'
-            },
-            'reminders': {
-                'useDefault': True
-            }
-        }
-        
-        try:
-            created = service.events().insert(calendarId=calendar_id, body=event).execute()
-            jst_time = start_time.strftime("%Y年%m月%d日 %H時%M分")
-            return {
-                "response": f"以下の時間に会議を登録しました：\n{jst_time}から1時間\n"
-                           f"予定のリンク：{created.get('htmlLink')}"
-            }
-        except Exception:
-            return {"response": "申し訳ありません。予定の登録中にエラーが発生しました。別の時間帯をお試しください。"}
-        try:
-            created = service.events().insert(calendarId=calendar_id, body=event).execute()
-            jst_time = start_time.strftime("%Y年%m月%d日 %H時%M分")
-            return {
-                "response": f"以下の時間に会議を登録しました：\n{jst_time}から1時間\n"
-                           f"予定のリンク：{created.get('htmlLink')}"
-            }
-        except Exception:
-            return {"response": "申し訳ありません。予定の登録中にエラーが発生しました。別の時間帯をお試しください。"}
-        
-        # Create event if no conflicts
-        event = {
-            'summary': '会議',
-            'start': {
-                'dateTime': start_time.astimezone(timezone.utc).isoformat().replace('+00:00', 'Z'),
-                'timeZone': 'Asia/Tokyo'
-            },
-            'end': {
-                'dateTime': end_time.astimezone(timezone.utc).isoformat().replace('+00:00', 'Z'),
-                'timeZone': 'Asia/Tokyo'
-            },
-            'reminders': {
-                'useDefault': True
-            }
-        }
-        
-        try:
-            created = service.events().insert(calendarId=calendar_id, body=event).execute()
-            jst_time = start_time.strftime("%Y年%m月%d日 %H時%M分")
-            return {
-                "response": f"以下の時間に会議を登録しました：\n{jst_time}から1時間\n"
-                           f"予定のリンク：{created.get('htmlLink')}"
-            }
-        except Exception:
-            return {"response": "申し訳ありません。予定の登録中にエラーが発生しました。別の時間帯をお試しください。"}
-            
     except Exception as e:
         print(f"Error: {str(e)}")
         return {"response": "申し訳ありません。予定の登録に失敗しました。"}
